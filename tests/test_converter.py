@@ -94,5 +94,35 @@ def main():
     print("\n✅ 测试通过!")
 
 
+def test_images():
+    """验证图片提取与嵌入"""
+    import tempfile
+    # 生成含图片的测试 PDF(插入真正的位图)
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    # 生成一张红色位图
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 200, 100))
+    pix.set_rect(fitz.IRect(0, 0, 200, 100), (204, 30, 30))  # 红色填充(0-255)
+    page.insert_image(fitz.Rect(60, 100, 300, 200), pixmap=pix)
+    page.insert_text((60, 260), "图片下方的文字段落", fontsize=12, fontname="china-s")
+    pdf_path = os.path.join(TEST_DIR, "sample_img.pdf")
+    doc.save(pdf_path)
+    doc.close()
+
+    img_dir = tempfile.mkdtemp()
+    result = convert_pdf_to_docx(pdf_path, SAMPLE_DOCX, font_size_label="三号", image_dir=img_dir)
+    assert result["images"] >= 1, "未提取到图片"
+    blocks = result["preview"]
+    img_blocks = [b for b in blocks if b["type"] == "image"]
+    assert img_blocks, "预览数据中没有图片块"
+    assert any(os.path.isfile(b.get("path", "")) for b in img_blocks), "图片缓存文件不存在"
+
+    # 验证 docx 内嵌图片
+    docx = Document(SAMPLE_DOCX)
+    assert len(docx.inline_shapes) >= 1, "docx 未嵌入图片"
+    print(f"\n✅ 图片测试通过: 提取 {result['images']} 张,docx 内嵌 {len(docx.inline_shapes)} 张")
+
+
 if __name__ == "__main__":
     main()
+    test_images()

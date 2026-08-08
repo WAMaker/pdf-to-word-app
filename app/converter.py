@@ -42,16 +42,29 @@ class TextLine:
 
 
 @dataclass
+class ImageBlock:
+    """PDF 中提取的图片块"""
+    bbox: Tuple[float, float, float, float]
+    xref: int             # PDF 对象编号,用于提取图片数据
+    width: int            # 像素宽
+    height: int           # 像素高
+    page_index: int = 0
+
+
+@dataclass
 class Paragraph:
-    """重建后的逻辑段落"""
+    """重建后的逻辑段落(可能是文本段落或图片)"""
     lines: List[TextLine] = field(default_factory=list)
-    style: str = "body"      # 'title' | 'heading' | 'body' | 'caption'
+    image: Optional[ImageBlock] = None  # 图片段落时非空
+    style: str = "body"      # 'title' | 'heading' | 'body' | 'caption' | 'image'
     align: str = "left"
     indent_first: float = 0.0   # 首行缩进(pt)
     indent_left: float = 0.0    # 左缩进(pt)
 
     @property
     def text(self) -> str:
+        if self.image is not None:
+            return "[图片]"
         # 合并行内文本:英文单词间需要空格,中文直接拼接
         parts = []
         for line in self.lines:
@@ -101,6 +114,57 @@ def _is_blank_line(s: str) -> bool:
 # ---------------------------------------------------------------------------
 # 段落重建
 # ---------------------------------------------------------------------------
+
+def _extract_images(page: fitz.Page) -> List[ImageBlock]:
+    """提取页面中的图片块"""
+    images: List[ImageBlock] = []
+    page_images = page.get_images(full=True)
+    seen = set()
+    for img in page_images:
+        xref = img[0]
+        if xref in seen:
+            continue
+        seen.add(xref)
+        try:
+            rects = page.get_image_rects(xref)
+        except Exception:  # noqa: BLE001
+            continue
+        if not rects:
+            continue
+        # 取最大的一块显示区域
+        rect = max(rects, key=lambda r: (r.width * r.height))
+        # 过滤:占满整页的背景图(如扫描件)跳过,避免把扫描页当插图
+        page_area = page.rect.width * page.rect.height
+        if rect.width * rect.height > page_area * 0.9:
+            continue
+        images.append(ImageBlock(
+            bbox=(rect.x0, rect.y0, rect.x1, rect.y1),
+            xref=xref,
+            width=img[2],
+            height=img[3],
+        ))
+    return images
+
+
+def _extract_elements(page: fitz.Page) -> Tuple[List[TextLine], List[ImageBlock]]:
+    """同时提取文本行和图片(按 y 坐标排序的元素流由调用方处理)"""
+    lines = _extract_lines(page)
+    images = _extract_images(page)
+    return lines, images
+
+
+def _merge_elements(lines: List[TextLine], images: List[ImageBlock]):
+    """把文本行和图片块按垂直位置合并成有序元素流
+    返回 (y, kind, obj) 元组列表:kind='line'|'image'
+    """
+    elements = []
+    for line in lines:
+        elements.append((line.bbox[1], "line", line))
+    for img in images:
+        elements.append((img.bbox[1], "image", img))
+    elements.sort(key=lambda e: (e[0], 0 if e[1] == "line" else 1))
+    return elements
+
 
 def _extract_lines(page: fitz.Page) -> List[TextLine]:
     """从页面提取文本行(使用 dict 模式获得字体/字号/位置信息)"""
@@ -213,13 +277,29 @@ def _align_from_lines(para: Paragraph, page_width: float) -> str:
     return Counter(aligns).most_common(1)[0][0] or "left"
 
 
-def rebuild_paragraphs(lines: List[TextLine], page_width: float, page_height: float) -> List[Paragraph]:
-    """把提取的行重建为逻辑段落"""
+def rebuild_paragraphs(lines: List[TextLine], page_width: float, page_height: float,
+                       images: Optional[List[ImageBlock]] = None) -> List[Paragraph]:
+    """把提取的行重建为逻辑段落(支持图片穿插)"""
     paragraphs: List[Paragraph] = []
     current: Optional[Paragraph] = None
+
+    elements = _merge_elements(lines, images or [])
     para_gap, line_gap = _estimate_para_gap(lines)
 
-    for line in lines:
+    for _, kind, obj in elements:
+        if kind == "image":
+            # 图片:先结束当前文本段落,再作为独立段落插入
+            if current is not None:
+                paragraphs.append(current)
+                current = None
+            paragraphs.append(Paragraph(
+                image=obj,
+                style="image",
+                align="center",
+            ))
+            continue
+
+        line = obj  # TextLine
         if _is_blank_line(line.text):
             if current is not None:
                 paragraphs.append(current)
@@ -241,8 +321,10 @@ def rebuild_paragraphs(lines: List[TextLine], page_width: float, page_height: fl
     if current is not None:
         paragraphs.append(current)
 
-    # 后处理:样式推断 + 对齐修正
+    # 后处理:样式推断 + 对齐修正(跳过图片段落)
     for para in paragraphs:
+        if para.image is not None:
+            continue
         para.align = _align_from_lines(para, page_width)
         para.style = _infer_style(para.lines[0], True, para.lines)
         # 首行缩进检测:第二行比第一行靠左,且第一行有缩进 → 段落缩进
@@ -291,8 +373,53 @@ def _set_run_font(run, font_name: str, size_pt: float, bold: bool = False):
     run._element.rPr.rFonts.set(qn("w:eastAsia"), font_name)
 
 
-def add_paragraph(doc: Document, para: Paragraph, font_name: str, base_size: float):
-    """把重建段落写入 docx"""
+def _extract_image_bytes(pdf: fitz.Document, xref: int) -> Tuple[Optional[bytes], str]:
+    """从 PDF 提取图片原始字节和扩展名"""
+    try:
+        info = pdf.extract_image(xref)
+        if not info:
+            return None, "png"
+        return info["image"], info["ext"]
+    except Exception:  # noqa: BLE001
+        return None, "png"
+
+
+def _add_image_to_doc(doc: Document, pdf: fitz.Document, img: ImageBlock,
+                      image_dir: str, page_width: float) -> Optional[str]:
+    """提取 PDF 图片并插入 docx,返回图片本地路径(供预览)
+    :param image_dir: 图片缓存目录(预览用)
+    """
+    data, ext = _extract_image_bytes(pdf, img.xref)
+    if not data:
+        return None
+
+    # 保存到缓存目录供预览使用
+    os.makedirs(image_dir, exist_ok=True)
+    img_path = os.path.join(image_dir, f"img_{img.xref}.{ext}")
+    with open(img_path, "wb") as f:
+        f.write(data)
+
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    try:
+        run = p.add_run()
+        run.add_picture(img_path, width=Pt(min(img.bbox[2] - img.bbox[0], page_width * 0.9)))
+    except Exception:  # noqa: BLE001
+        # 图片格式 docx 不支持时跳过
+        return None
+    return img_path
+
+
+def add_paragraph(doc: Document, para: Paragraph, font_name: str, base_size: float,
+                 pdf: Optional[fitz.Document] = None,
+                 image_dir: Optional[str] = None,
+                 page_width: float = 595.0) -> Optional[str]:
+    """把重建段落写入 docx;图片段落返回本地图片路径
+    :return: 图片段落返回图片路径,文本段落返回 None
+    """
+    if para.image is not None and pdf is not None:
+        return _add_image_to_doc(doc, pdf, para.image, image_dir or "", page_width)
+
     p = doc.add_paragraph()
     pf = p.paragraph_format
 
@@ -326,7 +453,7 @@ def add_paragraph(doc: Document, para: Paragraph, font_name: str, base_size: flo
     run = p.add_run(text)
     _set_run_font(run, font_name, size, bold)
 
-    return p
+    return None
 
 
 def convert_pdf_to_docx(
@@ -335,6 +462,7 @@ def convert_pdf_to_docx(
     font_size_label: str = "三号",
     font_name: str = "微软雅黑",
     progress_cb=None,
+    image_dir: Optional[str] = None,
 ) -> dict:
     """
     转换主入口
@@ -343,6 +471,8 @@ def convert_pdf_to_docx(
     :param font_size_label: 字号('小四'/'四号'/'小三'/'三号'/'小二'/'二号')
     :param font_name: 中文字体名
     :param progress_cb: 进度回调(page_index, total_pages)
+    :param image_dir: 图片缓存目录(用于预览;为 None 时不保留预览图片)
+    :return: 转换结果,含 preview 结构化数据(段落+图片)
     """
     if not os.path.isfile(pdf_path):
         raise FileNotFoundError(f"PDF 文件不存在: {pdf_path}")
@@ -354,16 +484,35 @@ def convert_pdf_to_docx(
     pdf = fitz.open(pdf_path)
     total = pdf.page_count
     para_count = 0
+    image_count = 0
+    preview_blocks: List[dict] = []  # 预览结构化数据
 
     try:
         for i, page in enumerate(pdf):
             if progress_cb:
                 progress_cb(i + 1, total)
-            lines = _extract_lines(page)
-            paragraphs = rebuild_paragraphs(lines, page.rect.width, page.rect.height)
+            lines, images = _extract_elements(page)
+            paragraphs = rebuild_paragraphs(lines, page.rect.width, page.rect.height, images)
             for para in paragraphs:
-                add_paragraph(doc, para, font_name, base_size)
-                para_count += 1
+                img_path = add_paragraph(
+                    doc, para, font_name, base_size,
+                    pdf=pdf, image_dir=image_dir, page_width=page.rect.width,
+                )
+                if para.image is not None:
+                    if img_path:
+                        image_count += 1
+                    preview_blocks.append({
+                        "type": "image",
+                        "path": img_path,
+                    })
+                else:
+                    para_count += 1
+                    preview_blocks.append({
+                        "type": "text",
+                        "text": para.text,
+                        "style": para.style,
+                        "align": para.align,
+                    })
     finally:
         pdf.close()
 
@@ -372,7 +521,9 @@ def convert_pdf_to_docx(
     return {
         "pages": total,
         "paragraphs": para_count,
+        "images": image_count,
         "output": docx_path,
         "font": font_name,
         "font_size": font_size_label,
+        "preview": preview_blocks,
     }
