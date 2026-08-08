@@ -214,15 +214,60 @@ def _detect_align(line, page_width: float) -> str:
     return "left"
 
 
-def _infer_style(line: TextLine, is_first: bool, para_lines: List[TextLine]) -> str:
-    """推断段落样式:标题 / 小标题 / 正文(基于字号+加粗+对齐,不强制 bold 标志)"""
+def _infer_style(line: TextLine, is_first: bool, para_lines: List[TextLine],
+                 body_size: float = 0.0) -> str:
+    """推断段落样式:标题 / 小标题 / 正文
+    策略:基于相对字号(与正文字号比较)+ 加粗 + 文本长度 + 段落结构
+    不依赖绝对字号阈值,适应不同文档的字体大小习惯。
+    :param body_size: 页面正文字号估计(0 表示未知,退回绝对阈值)
+    """
+    para_text = "".join(l.text for l in para_lines)
+    para_len = len(para_text.strip())
+    # 以句末标点结尾的通常是正文残片,不是标题
+    ends_with_punct = para_text.rstrip().endswith(("。", ".", "！", "？", "!", "?", "，", ","))
+
+    # 绝对阈值兜底:超大字号必为标题
     if line.size >= 20:
         return "title"
+    if body_size > 0:
+        ratio = line.size / body_size
+        # 明显大(≥1.3x)且段落短(<60字)→ 标题
+        if ratio >= 1.3 and para_len < 60:
+            return "title" if ratio >= 1.8 else "heading"
+        # 略大(≥1.05x)且加粗且段落很短(≤20字)→ 小标题
+        if ratio >= 1.05 and line.bold and para_len <= 20 and not ends_with_punct:
+            return "heading"
+        # 同字号加粗且段落极短(≤12字)且单行且不以标点结尾 → 小标题
+        if abs(ratio - 1.0) < 0.05 and line.bold and para_len <= 12 \
+                and len(para_lines) == 1 and not ends_with_punct:
+            return "heading"
+        return "body"
+    # 未知正文字号时:字号 >= 14 且加粗/居中/短文本 → 标题
     if line.size >= 14:
-        # 大字号通常是小标题;居中且短文本也可能是标题
-        if line.bold or line.align == "center" or len(line.text) < 30:
+        if line.bold or line.align == "center" or para_len < 30:
             return "heading"
     return "body"
+
+
+def _estimate_body_size(lines: List[TextLine]) -> float:
+    """估计页面正文字号:取非加粗文本量最大的字号(众数加权)
+    排除加粗行,避免标题/强调行干扰正文基准。
+    """
+    if not lines:
+        return 0.0
+    from collections import Counter
+    counter = Counter()
+    for line in lines:
+        if line.text and not line.bold:
+            counter[round(line.size, 1)] += len(line.text)
+    if not counter:
+        # 全部加粗时退回全量统计
+        for line in lines:
+            if line.text:
+                counter[round(line.size, 1)] += len(line.text)
+    if not counter:
+        return 0.0
+    return counter.most_common(1)[0][0]
 
 
 def _same_paragraph(prev: TextLine, cur: TextLine, para_gap: float, line_gap: float) -> bool:
@@ -322,11 +367,12 @@ def rebuild_paragraphs(lines: List[TextLine], page_width: float, page_height: fl
         paragraphs.append(current)
 
     # 后处理:样式推断 + 对齐修正(跳过图片段落)
+    body_size = _estimate_body_size(lines)
     for para in paragraphs:
         if para.image is not None:
             continue
         para.align = _align_from_lines(para, page_width)
-        para.style = _infer_style(para.lines[0], True, para.lines)
+        para.style = _infer_style(para.lines[0], True, para.lines, body_size)
         # 首行缩进检测:第二行比第一行靠左,且第一行有缩进 → 段落缩进
         if len(para.lines) > 1:
             first_x0 = para.lines[0].bbox[0]

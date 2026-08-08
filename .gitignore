@@ -7,3 +7,4 @@ build/
 tests/sample.pdf
 tests/sample.docx
 .DS_Store
+samples/preview_imgs/
