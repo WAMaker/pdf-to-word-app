@@ -6,6 +6,9 @@ on:
       - "v*"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -39,4 +42,15 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/PDF转Word.exe
-          generate_release_notes: true
+          generate_release_notes: false
+          name: PDF转Word v${{ github.ref_name }}
+          body: |
+            ## PDF 转 Word v${{ github.ref_name }}
+
+            - 段落重建:PDF 转 Word 后为完整逻辑段落,改字号不乱版
+            - 图片保留:PDF 图片自动提取嵌入 Word
+            - 效果预览:切换字号/字体即时预览
+            - 字号:小四~二号 6 档可选
+            - 字体:微软雅黑 / 宋体 / 黑体 / 楷体 / 仿宋
+
+            下载 `PDF转Word.exe` 即可使用(无需安装)。
