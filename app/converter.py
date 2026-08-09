@@ -277,6 +277,18 @@ def _infer_style(line: TextLine, is_first: bool, para_lines: List[TextLine],
     ends_with_punct = para_text.rstrip().endswith((
         "。", ".", "！", "？", "!", "?", "，", ",", "；", ";", "、", "：", ":",
     ))
+    # 选择题选项行(A./B./C./D. 开头)永远是正文,不是标题
+    if line.option_marker:
+        return "body"
+    # 以'A.'/'B.'等选项字母开头的段落也是选项(结构树清理后可能丢 option_marker)
+    if re.match(r"^[A-D][.、．]\s*", para_text.strip()):
+        return "body"
+    # 答案行([答案]X / 答案：X)是正文,不是标题
+    if re.match(r"^[\[【]?答案[\]】]?[:：]?", para_text.strip()):
+        return "body"
+    # 题目行(多選題/單選題/問答題 开头)是小标题
+    if re.match(r"^[\[【]?(單選題|多選題|判斷題|簡答題|問答題)", para_text.strip()):
+        return "heading"
 
     # 全文档首段 + 加粗 + 单行 + 短文本 → 大标题(如课程标题)
     if is_first and line.bold and len(para_lines) == 1 and para_len <= 40:

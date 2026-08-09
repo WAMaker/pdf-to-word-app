@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """测试:生成中文测试 PDF 并转换,验证段落重建效果"""
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -236,6 +237,18 @@ def test_ear_docx():
     assert "即耳輪4區，三角窩前方的耳輪處" in all_text, "选项B未独立"
     # 答案行独立(结构树输出'答案D'或'[答案]ABCD')
     assert "答案D" in all_text and "ABCD" in all_text, "答案行未独立"
+    # 选项行样式:选项/答案应为正文(16pt),不是标题
+    option_paras = [x for x in d.paragraphs if x.text.strip()
+                    and re.match(r"^[A-D][.、．]", x.text.strip())]
+    assert option_paras, "未找到选项行"
+    for x in option_paras:
+        size = max((rr.font.size.pt if rr.font.size else 0) for rr in x.runs)
+        assert size <= 16.5, f"选项行被误判为标题({size}pt): {x.text[:25]}"
+    answer_paras = [x for x in d.paragraphs if x.text.strip()
+                    and re.match(r"^[\[【]?答案", x.text.strip())]
+    for x in answer_paras:
+        size = max((rr.font.size.pt if rr.font.size else 0) for rr in x.runs)
+        assert size <= 16.5, f"答案行被误判为标题({size}pt): {x.text[:25]}"
     os.remove(docx_path)
     print(f"\n✅ 耳诊样例测试通过: {result['paragraphs']} 段, {result['images']} 图")
 
