@@ -261,8 +261,49 @@ def test_ear_docx():
     print(f"\n✅ 耳诊样例测试通过: {result['paragraphs']} 段, {result['images']} 图")
 
 
+def test_font_signal():
+    """加粗检测多信号源:不依赖字体名(Bold/Black),FontWeight/黑体名也识别"""
+    from app.converter import _font_name_is_bold, _analyze_fonts
+
+    # 字体名信号
+    assert _font_name_is_bold("SimHei"), "黑体(SimHei)应识别为加粗"
+    assert _font_name_is_bold("Heiti SC"), "黑体(Heiti)应识别为加粗"
+    assert not _font_name_is_bold("SimSun"), "宋体不应误判为加粗"
+    assert not _font_name_is_bold("KaiTi"), "楷体不应误判为加粗"
+    assert not _font_name_is_bold("MicrosoftYaHei"), "雅黑常规不应误判(含hei词根但排除yahei)"
+    assert _font_name_is_bold("MicrosoftYaHei-Bold"), "雅黑粗体应识别"
+    assert _font_name_is_bold("PingFangSC-Semibold"), "半粗体应识别"
+
+    # FontWeight 信号:重命名粗体字体(去掉 Bold 后缀)仍应识别
+    import shutil
+    src = os.path.join(os.path.dirname(TEST_DIR), "samples", "抱朴-經絡輔導課20.pdf")
+    if os.path.isfile(src):
+        dst = os.path.join(TEST_DIR, "font_renamed.pdf")
+        shutil.copy(src, dst)
+        pdf = fitz.open(dst)
+        for xref in range(1, pdf.xref_length()):
+            try:
+                obj = pdf.xref_object(xref, compressed=False)
+            except Exception:
+                continue
+            if "MicrosoftYaHei-Bold" in obj:
+                pdf.update_object(xref, obj.replace("MicrosoftYaHei-Bold", "MyFont-Bd"))
+        pdf.save(dst.replace(".pdf", "_2.pdf"), incremental=False,
+                 encryption=fitz.PDF_ENCRYPT_KEEP)
+        pdf.close()
+        pdf2 = fitz.open(dst.replace(".pdf", "_2.pdf"))
+        fm = _analyze_fonts(pdf2)
+        pdf2.close()
+        assert fm.get("myfont-bd") is True, f"FontWeight信号应识别粗体: {fm}"
+        assert fm.get("microsoftyahei") is False, f"常规字体不应误判: {fm}"
+        os.remove(dst)
+        os.remove(dst.replace(".pdf", "_2.pdf"))
+    print("\n✅ 字体信号测试通过: 字体名/FontWeight/黑体名多信号源")
+
+
 if __name__ == "__main__":
     main()
     test_images()
     test_realistic_docx()
     test_ear_docx()
+    test_font_signal()

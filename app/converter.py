@@ -91,12 +91,127 @@ class Paragraph:
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
 
 
-def _is_bold_font(font_name: str) -> bool:
-    """判断字体是否为粗体(PDF 结构化属性:字体名含 Bold/Black/Heavy)"""
+_BOLD_FONT_KEYWORDS = ("bold", "black", "heavy", "demibold", "semibold", "extrabold", "ultrabold")
+# 黑体类字体名(SimHei/Heiti/Hei/Gothic),但排除 YaHei(雅黑是常规字体)
+_BOLD_FONT_NAMES = re.compile(r"(?:^|[^a-z])(hei|heiti|gothic)")
+
+
+def _font_name_is_bold(font_name: str) -> bool:
+    """从字体名判断粗体(PDF 结构化属性:字体名含 Bold/Black/Heavy 等)
+    这是第一信号源;不同 PDF 的命名习惯不同,
+    需配合 FontDescriptor(FontWeight/StemV) 和文档内相对比较。
+    """
     if not font_name:
         return False
     name = font_name.lower()
-    return any(k in name for k in ("bold", "black", "heavy", "demibold", "semibold"))
+    if any(k in name for k in _BOLD_FONT_KEYWORDS):
+        return True
+    # 黑体(SimHei/Heiti):匹配 hei 词根,但排除 yahei(雅黑常规字体)
+    if "yahei" not in name and "hei" in name:
+        return True
+    if _BOLD_FONT_NAMES.search(name):
+        return True
+    return False
+
+
+def _analyze_fonts(pdf: fitz.Document) -> dict:
+    """扫描全文档字体资源,构建 字体名→是否加粗 映射。
+    多信号源,不依赖单一命名习惯:
+    1. FontDescriptor /FontWeight (100-900, ≥600 为粗体,最可靠)
+    2. 字体名关键词(Bold/Black/Heavy 等)
+    3. FontDescriptor Flags ForceBold(bit 18=0x40000)
+    4. 兜底:StemV 文档内相对比较(无 FontWeight 时)
+    返回 {字体名(小写): True/False}
+    """
+    result: dict = {}
+    # 收集所有页面的字体资源
+    font_infos = {}  # fontname -> 各信号
+    for pno in range(pdf.page_count):
+        try:
+            fonts = pdf[pno].get_fonts(full=True)
+        except Exception:  # noqa: BLE001
+            continue
+        for f in fonts:
+            if len(f) < 4:
+                continue
+            basefont = str(f[3])  # 如 'BCDEEE+MicrosoftYaHei-Bold'
+            short = basefont.split("+")[-1].lower()
+            font_infos.setdefault(short, {
+                "name_bold": _font_name_is_bold(short),
+                "fontweight": None,
+                "stemv": None,
+                "forcebold": False,
+                "symbolic": False,
+            })
+
+    # 找 FontDescriptor 补充 FontWeight/StemV/Flags
+    for xref in range(1, pdf.xref_length()):
+        try:
+            obj = pdf.xref_object(xref, compressed=False)
+        except Exception:  # noqa: BLE001
+            continue
+        if "/FontDescriptor" not in obj:
+            continue
+        fn_m = re.search(r"/FontName\s*/([^/\s>]+)", obj)
+        if not fn_m:
+            continue
+        short = fn_m.group(1).split("+")[-1].lower()
+        if short not in font_infos:
+            continue
+        fw_m = re.search(r"/FontWeight\s+(\d+)", obj)
+        stemv_m = re.search(r"/StemV\s+([0-9.]+)", obj)
+        flags_m = re.search(r"/Flags\s+(\d+)", obj)
+        if fw_m:
+            font_infos[short]["fontweight"] = int(fw_m.group(1))
+        if stemv_m:
+            font_infos[short]["stemv"] = float(stemv_m.group(1))
+        if flags_m:
+            flags_int = int(flags_m.group(1))
+            font_infos[short]["forcebold"] = bool(flags_int & 0x40000)
+            font_infos[short]["symbolic"] = bool(flags_int & 0x4)
+
+    # 文档内相对比较:仅对无 FontWeight 的字体,用 StemV 与常规基准比较
+    stemvs = [v["stemv"] for v in font_infos.values()
+              if v["stemv"] is not None and v["fontweight"] is None
+              and not v["name_bold"] and not v["symbolic"]]
+    base_stemv = None
+    if stemvs:
+        sorted_v = sorted(stemvs)
+        base_stemv = sorted_v[len(sorted_v) // 2]
+
+    for short, info in font_infos.items():
+        # 1) FontWeight 优先(最可靠,Word 导出必带)
+        if info["fontweight"] is not None:
+            result[short] = info["fontweight"] >= 600
+            continue
+        # 2) 符号字体非正文粗体
+        if info.get("symbolic"):
+            result[short] = False
+            continue
+        # 3) 字体名关键词 / ForceBold
+        if info["name_bold"] or info["forcebold"]:
+            result[short] = True
+            continue
+        # 4) StemV 相对比较(无 FontWeight 时的兜底)
+        if info["stemv"] is not None and base_stemv and info["stemv"] >= base_stemv * 1.25:
+            result[short] = True
+            continue
+        result[short] = False
+    return result
+
+
+def _is_bold_font(font_name: str, font_map: Optional[dict] = None) -> bool:
+    """判断字体是否为粗体。
+    优先查文档级字体映射(多信号),回退字体名关键词。
+    """
+    if not font_name:
+        return False
+    short = font_name.split("+")[-1].lower()
+    if font_map:
+        if short in font_map:
+            return bool(font_map[short])
+        # 映射表无此字体(可能动态加载):回退名字关键词
+    return _font_name_is_bold(font_name)
 
 
 def _is_cjk_text(text: str) -> bool:
@@ -168,9 +283,9 @@ def _extract_images(page: fitz.Page) -> List[ImageBlock]:
     return images
 
 
-def _extract_elements(page: fitz.Page) -> Tuple[List[TextLine], List[ImageBlock]]:
+def _extract_elements(page: fitz.Page, font_map: Optional[dict] = None) -> Tuple[List[TextLine], List[ImageBlock]]:
     """同时提取文本行和图片(按 y 坐标排序的元素流由调用方处理)"""
-    lines = _extract_lines(page)
+    lines = _extract_lines(page, font_map)
     images = _extract_images(page)
     return lines, images
 
@@ -188,8 +303,10 @@ def _merge_elements(lines: List[TextLine], images: List[ImageBlock]):
     return elements
 
 
-def _extract_lines(page: fitz.Page) -> List[TextLine]:
-    """从页面提取文本行(使用 dict 模式获得字体/字号/位置信息)"""
+def _extract_lines(page: fitz.Page, font_map: Optional[dict] = None) -> List[TextLine]:
+    """从页面提取文本行(使用 dict 模式获得字体/字号/位置信息)
+    :param font_map: 文档级字体→加粗映射(多信号源),None 时仅用字体名
+    """
     lines: List[TextLine] = []
     blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)["blocks"]
     for block in blocks:
@@ -206,16 +323,15 @@ def _extract_lines(page: fitz.Page) -> List[TextLine]:
             bbox = line.get("bbox", (0, 0, 0, 0))
             sizes = [s.get("size", 12.0) for s in spans]
             fonts = [s.get("font", "") for s in spans]
-            # 加粗 = 字体名含 Bold/Black/Heavy(PDF 结构化样式属性)
-            # 这是 PDF 自身的字体信息,比 flags 位更可靠,也避免内容特判
-            bold = any(_is_bold_font(f) for f in fonts)
+            # 加粗 = 文档字体映射(字体名 + FontDescriptor + 相对比较)
+            bold = any(_is_bold_font(f, font_map) for f in fonts)
             # 行内分段样式:逐 span 收集 (文本, 加粗),供行内部分加粗保留
             span_styles: List[Tuple[str, bool]] = []
             for s in spans:
                 st = _clean_text(s.get("text", ""))
                 if not st:
                     continue
-                span_styles.append((st, _is_bold_font(s.get("font", ""))))
+                span_styles.append((st, _is_bold_font(s.get("font", ""), font_map)))
             if not span_styles:
                 span_styles = [(text, bold)]
             lines.append(TextLine(
@@ -516,7 +632,8 @@ def _norm_for_match(s: str) -> str:
     return s
 
 
-def _extract_structured_paragraphs(pdf: fitz.Document) -> Optional[List[StructPara]]:
+def _extract_structured_paragraphs(pdf: fitz.Document,
+                                   font_map: Optional[dict] = None) -> Optional[List[StructPara]]:
     """从 Tagged PDF 结构树提取作者真实段落。
     返回 None 表示该 PDF 无结构树(退回启发式段落重建)。
     递归遍历结构树,支持:
@@ -562,7 +679,7 @@ def _extract_structured_paragraphs(pdf: fitz.Document) -> Optional[List[StructPa
     # 每页行缓存(用于 y/x 定位和加粗匹配)
     page_lines_cache: dict = {}
     for pi in range(pdf.page_count):
-        page_lines_cache[pi] = _extract_lines(pdf[pi])
+        page_lines_cache[pi] = _extract_lines(pdf[pi], font_map)
 
     def _elem_text(elem_xref: int, depth: int = 0) -> str:
         """递归提取元素文本(聚合所有后代 Span 的 ActualText)"""
@@ -854,7 +971,9 @@ def convert_pdf_to_docx(
     first_text_done = False  # 跨页追踪全文档第一个文本段落(标题识别用)
 
     # 首选:Tagged PDF 结构树(作者真实段落,无需启发式)
-    struct_paras = _extract_structured_paragraphs(pdf)
+    # 文档级字体加粗映射(多信号源:字体名+FontDescriptor+相对比较)
+    font_map = _analyze_fonts(pdf)
+    struct_paras = _extract_structured_paragraphs(pdf, font_map)
     used_struct = struct_paras is not None
 
     try:
@@ -867,7 +986,7 @@ def convert_pdf_to_docx(
             # 预提取每页行级加粗信息(结构树无 bold,需从行信息匹配)
             page_lines_cache = {}
             for i in range(pdf.page_count):
-                page_lines_cache[i] = _extract_lines(pdf[i])
+                page_lines_cache[i] = _extract_lines(pdf[i], font_map)
             # 预提取每页图片(y 定位用)
             page_imgs_cache = {}
             for i in range(pdf.page_count):
@@ -983,7 +1102,7 @@ def convert_pdf_to_docx(
                 # 可选:按 PDF 原页插入分页符(默认关闭,避免 Word 半空页)
                 if i > 0 and page_breaks:
                     doc.add_page_break()
-                lines, images = _extract_elements(page)
+                lines, images = _extract_elements(page, font_map)
                 paragraphs = rebuild_paragraphs(
                     lines, page.rect.width, page.rect.height, images,
                     first_text=not first_text_done,
