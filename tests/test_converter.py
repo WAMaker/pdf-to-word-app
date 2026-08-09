@@ -234,8 +234,8 @@ def test_ear_docx():
     # 选项行独立(结构树模式输出清理了空格/括号: 'A.即耳輪3區...')
     assert "即耳輪3區，三角窩前方的耳輪處" in all_text, "选项A未独立"
     assert "即耳輪4區，三角窩前方的耳輪處" in all_text, "选项B未独立"
-    # 答案行独立
-    assert "[答案]D" in all_text, "答案行未独立"
+    # 答案行独立(结构树输出'答案D'或'[答案]ABCD')
+    assert "答案D" in all_text and "ABCD" in all_text, "答案行未独立"
     os.remove(docx_path)
     print(f"\n✅ 耳诊样例测试通过: {result['paragraphs']} 段, {result['images']} 图")
 

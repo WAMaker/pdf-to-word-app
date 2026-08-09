@@ -273,8 +273,10 @@ def _infer_style(line: TextLine, is_first: bool, para_lines: List[TextLine],
     """
     para_text = "".join(l.text for l in para_lines)
     para_len = len(para_text.strip())
-    # 以句末标点结尾的通常是正文残片,不是标题
-    ends_with_punct = para_text.rstrip().endswith(("。", ".", "！", "？", "!", "?", "，", ","))
+    # 以句末标点(含分号/顿号/冒号,列表项)结尾的通常是正文/列表项,不是标题
+    ends_with_punct = para_text.rstrip().endswith((
+        "。", ".", "！", "？", "!", "?", "，", ",", "；", ";", "、", "：", ":",
+    ))
 
     # 全文档首段 + 加粗 + 单行 + 短文本 → 大标题(如课程标题)
     if is_first and line.bold and len(para_lines) == 1 and para_len <= 40:
@@ -290,7 +292,7 @@ def _infer_style(line: TextLine, is_first: bool, para_lines: List[TextLine],
     if body_size > 0:
         ratio = line.size / body_size
         # 明显大(≥1.3x)且段落短(<60字)→ 标题
-        if ratio >= 1.3 and para_len < 60:
+        if ratio >= 1.3 and para_len < 60 and not ends_with_punct:
             return "title" if ratio >= 1.8 else "heading"
         # 略大(≥1.05x)且加粗且段落很短(≤20字)→ 小标题
         if ratio >= 1.05 and line.bold and para_len <= 20 and not ends_with_punct:
@@ -302,7 +304,7 @@ def _infer_style(line: TextLine, is_first: bool, para_lines: List[TextLine],
         return "body"
     # 未知正文字号时:字号 >= 14 且加粗/居中/短文本 → 标题
     if line.size >= 14:
-        if line.bold or line.align == "center" or para_len < 30:
+        if (line.bold or line.align == "center" or para_len < 30) and not ends_with_punct:
             return "heading"
     return "body"
 
@@ -965,29 +967,46 @@ def convert_pdf_to_docx(
                                     matched_line = line
                                     break
                         if matched_line is not None:
-                            style = _infer_style(matched_line, not first_text_done,
+                            style = _infer_style(matched_line, not struct_first_done,
                                                  [matched_line], body_size)
                         else:
                             style = "body"
                     para = Paragraph(lines=[], style=style, align="left")
-                    # 从页面行匹配:判断段落整体加粗(含匹配的加粗行即加粗)
+                    # 从页面行按出现顺序匹配,生成 span 级加粗(行内精确)
                     sp_norm = _norm_for_match(sp_text)
-                    para_bold = False
+                    matched_spans = []  # [(文本片段, 加粗)] 按原顺序
+                    rest = sp_norm
+                    pos = 0
                     for line in page_lines:
-                        lt_norm = _norm_for_match(line.text)
-                        if not lt_norm or len(lt_norm) < 4:
-                            continue
-                        if lt_norm in sp_norm or sp_norm in lt_norm:
-                            if line.bold:
-                                para_bold = True
-                                break
-                    # 标题样式整段加粗;正文整段按是否含加粗行
+                        # 用该行的 span 级片段(行内可能部分加粗,如穴位名)
+                        line_spans = [(t, b) for t, b in line.spans]
+                        for span_text, span_bold in line_spans:
+                            st_norm = _norm_for_match(span_text)
+                            if not st_norm or len(st_norm) < 2:
+                                continue
+                            idx = rest.find(st_norm, pos)
+                            if idx >= 0:
+                                if idx > pos:
+                                    matched_spans.append((rest[pos:idx], False))
+                                matched_spans.append((st_norm, span_bold))
+                                pos = idx + len(st_norm)
+                    if pos < len(rest):
+                        matched_spans.append((rest[pos:], False))
+                    if not matched_spans:
+                        matched_spans = [(sp_norm, False)]
+                    # 标题样式整段加粗;正文按行级加粗(span 级)
                     if style in ("title", "heading"):
                         para_bold = True
+                        span_data = [(sp_text, True)]
+                        out_text = sp_text
+                    else:
+                        para_bold = any(b for _, b in matched_spans)
+                        span_data = matched_spans
+                        out_text = "".join(t for t, _ in matched_spans)
                     para.lines.append(TextLine(
-                        text=sp_text, bbox=(0, 0, 0, 0), size=base_size,
+                        text=out_text, bbox=(0, 0, 0, 0), size=base_size,
                         font=font_name, bold=para_bold, align="left",
-                        spans=[(sp_text, para_bold)],
+                        spans=span_data,
                     ))
                     # 正文段落:匹配页面行推断首行缩进(结构树无缩进信息)
                     if style == "body":
@@ -1000,15 +1019,14 @@ def convert_pdf_to_docx(
                                 best_x0 = max(best_x0, line.bbox[0])
                         if best_x0 > 100:
                             para.indent_first = best_x0 - 90.0
-                    span_data = [(sp_text, para_bold)]
                     add_paragraph(doc, para, font_name, base_size,
                                   pdf=pdf, image_dir=image_dir, page_width=page.rect.width)
                     para_count += 1
-                    if not first_text_done:
-                        first_text_done = True
+                    if not struct_first_done:
+                        struct_first_done = True
                     preview_blocks.append({
                         "type": "text",
-                        "text": sp_text,
+                        "text": out_text,
                         "style": style,
                         "align": "left",
                         "spans": span_data,
