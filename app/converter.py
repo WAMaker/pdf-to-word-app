@@ -307,7 +307,9 @@ def _same_paragraph(prev: TextLine, cur: TextLine, para_gap: float, line_gap: fl
     :param line_gap: 行内间距基准(pt,取中位数)
     段落边界识别策略(按优先级):
     1. 行距显著大于行内基准 → 新段(真实的段间距)
-    2. 当前行比上一行明显右移(>12pt)→ 新段(首行缩进,最常见的段界标志)
+    2. 当前行比上一行明显右移(>12pt)→ 新段(首行缩进,最常见的段界标志);
+       但上一行以冒号/破折号/引号引导结尾(列举引导语)时除外——
+       如 '...功能：' + '第一，它能治療...' 是同一段。
     3. 其余情况合并为同一段。
     注意:不依赖 PDF 文本块 ID(同一段经常被拆成多个 block),
     也不在浮点边缘比较行距(有的行距 16.7、有的 16.8,阈值取中位数会误判)。
@@ -321,6 +323,10 @@ def _same_paragraph(prev: TextLine, cur: TextLine, para_gap: float, line_gap: fl
 
     # 2) 当前行有显著左缩进(>12pt),通常是新段落(如正文首行缩进)
     if cur.bbox[0] - prev.bbox[0] > 12:
+        # 例外:上一行以冒号/破折号等引导性标点结尾 → 列举引导语,续行合并
+        prev_tail = prev.text.rstrip()
+        if prev_tail.endswith(("：", ":", "——", "—", "“")):
+            return True
         return False
 
     # 2b) 当前行或上一行以列表符开头(如 'l 胃經腹部...'、'1. xxx')→ 列表项/小标题,必为新段
@@ -572,12 +578,17 @@ def add_paragraph(doc: Document, para: Paragraph, font_name: str, base_size: flo
         bold = True
     else:
         size = base_size
-        # 正文加粗:保留 PDF 原文的加粗样式(强调/章节说明)
-        bold = para.bold
 
-    text = para.text
-    run = p.add_run(text)
-    _set_run_font(run, font_name, size, bold)
+    # 写入文本:行级加粗(每行独立 run),保留 PDF 原文逐行的加粗/常规样式
+    # 而不是整段统一加粗——避免'原文只加粗一行,转换后整段变粗'的错判
+    if para.style == "body":
+        for line in para.lines:
+            run = p.add_run(line.text)
+            _set_run_font(run, font_name, size, line.bold)
+    else:
+        text = para.text
+        run = p.add_run(text)
+        _set_run_font(run, font_name, size, bold)
 
     return None
 
@@ -653,7 +664,8 @@ def convert_pdf_to_docx(
                         "text": para.text,
                         "style": para.style,
                         "align": para.align,
-                        "bold": para.bold,
+                        # 行级加粗:各行的 bold 状态(预览用)
+                        "line_bolds": [l.bold for l in para.lines] if para.style == "body" else [],
                     })
     finally:
         pdf.close()

@@ -184,10 +184,21 @@ def test_realistic_docx():
         li = p.paragraph_format.left_indent
         assert li is None or li.pt < 10, f"左缩进异常(应≈0): {li.pt if li else None}pt"
 
-    # 7) 加粗保留:PDF 中加粗段落应写入 docx run 加粗
+    # 7) 加粗保留:PDF 中加粗段落应写入 docx run 加粗(行级,非整段)
     bold_paras = [p for p in d.paragraphs if p.text.strip()
                   and any(r.font.bold for r in p.runs if r.text.strip())]
     assert len(bold_paras) >= 8, f"加粗段落过少: {len(bold_paras)}(期望≥8,PDF原文大量加粗)"
+
+    # 8) 行级加粗:原文只加粗部分行的段落,不应整段加粗
+    mixed_paras = [p for p in d.paragraphs if p.text.strip()
+                   and any(r.font.bold for r in p.runs if r.text.strip())
+                   and any(not r.font.bold for r in p.runs if r.text.strip())]
+    assert mixed_paras, "未找到行级混合加粗段落(原文部分行加粗的段落应保留为行级)"
+
+    # 9) 列举引导语合并:冒号结尾后跟'第一，'应合并为同一段(不是换行断裂)
+    all_text = "\n".join(p.text for p in d.paragraphs if p.text.strip())
+    assert "功能：第一，它能治療" in all_text, "列举引导语段落未正确合并(气冲功能段)"
+    assert "主治：第一，它能夠治療急" in all_text, "列举引导语段落未正确合并(梁丘主治段)"
     print(f"\n✅ 真实排版回归测试通过: {result['paragraphs']} 段, {result['images']} 图, 加粗 {len(bold_paras)} 段")
 
 
