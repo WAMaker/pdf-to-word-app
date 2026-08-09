@@ -183,7 +183,12 @@ def test_realistic_docx():
     for p in body_paras[:5]:
         li = p.paragraph_format.left_indent
         assert li is None or li.pt < 10, f"左缩进异常(应≈0): {li.pt if li else None}pt"
-    print(f"\n✅ 真实排版回归测试通过: {result['paragraphs']} 段, {result['images']} 图")
+
+    # 7) 加粗保留:PDF 中加粗段落应写入 docx run 加粗
+    bold_paras = [p for p in d.paragraphs if p.text.strip()
+                  and any(r.font.bold for r in p.runs if r.text.strip())]
+    assert len(bold_paras) >= 8, f"加粗段落过少: {len(bold_paras)}(期望≥8,PDF原文大量加粗)"
+    print(f"\n✅ 真实排版回归测试通过: {result['paragraphs']} 段, {result['images']} 图, 加粗 {len(bold_paras)} 段")
 
 
 if __name__ == "__main__":

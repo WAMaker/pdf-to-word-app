@@ -61,6 +61,7 @@ class Paragraph:
     align: str = "left"
     indent_first: float = 0.0   # 首行缩进(pt)
     indent_left: float = 0.0    # 左缩进(pt)
+    bold: bool = False          # 段落是否加粗(PDF 原样保留)
 
     @property
     def text(self) -> str:
@@ -362,6 +363,16 @@ def _align_from_lines(para: Paragraph, page_width: float) -> str:
     return Counter(aligns).most_common(1)[0][0] or "left"
 
 
+def _infer_para_bold(lines: List[TextLine]) -> bool:
+    """推断段落是否加粗:多数行加粗(≥50%)则段落加粗
+    保留 PDF 原文的加粗样式(强调、章节说明等)。
+    """
+    if not lines:
+        return False
+    bold_count = sum(1 for l in lines if l.bold)
+    return bold_count / len(lines) >= 0.5
+
+
 def rebuild_paragraphs(lines: List[TextLine], page_width: float, page_height: float,
                        images: Optional[List[ImageBlock]] = None,
                        first_text: bool = True) -> List[Paragraph]:
@@ -421,6 +432,7 @@ def rebuild_paragraphs(lines: List[TextLine], page_width: float, page_height: fl
             continue
         para.align = _align_from_lines(para, page_width)
         para.style = _infer_style(para.lines[0], is_first_local, para.lines, body_size)
+        para.bold = _infer_para_bold(para.lines)
         is_first_local = False  # 仅全文档第一个文本段落享受 title 候选
         # 首行缩进检测:第二行比第一行靠左,且第一行有缩进 → 段落缩进
         if len(para.lines) > 1:
@@ -560,7 +572,8 @@ def add_paragraph(doc: Document, para: Paragraph, font_name: str, base_size: flo
         bold = True
     else:
         size = base_size
-        bold = False
+        # 正文加粗:保留 PDF 原文的加粗样式(强调/章节说明)
+        bold = para.bold
 
     text = para.text
     run = p.add_run(text)
@@ -640,6 +653,7 @@ def convert_pdf_to_docx(
                         "text": para.text,
                         "style": para.style,
                         "align": para.align,
+                        "bold": para.bold,
                     })
     finally:
         pdf.close()

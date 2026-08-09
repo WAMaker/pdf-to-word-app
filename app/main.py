@@ -425,6 +425,7 @@ class MainWindow(QMainWindow):
                 continue
             style = block.get("style", "body")
             align = block.get("align", "left")
+            para_bold = block.get("bold", False)
 
             if style == "title":
                 px = size_px + 14
@@ -434,7 +435,8 @@ class MainWindow(QMainWindow):
                 weight = "bold"
             else:
                 px = size_px
-                weight = "normal"
+                # 保留 PDF 原文加粗(强调/章节说明)
+                weight = "bold" if para_bold else "normal"
 
             halign = {"center": "center", "right": "right", "justify": "justify"}.get(align, "left")
             esc = html.escape(text)
