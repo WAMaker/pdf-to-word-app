@@ -301,9 +301,40 @@ def test_font_signal():
     print("\n✅ 字体信号测试通过: 字体名/FontWeight/黑体名多信号源")
 
 
+def test_zangxiang_docx():
+    """第三份样例:藏象课件 PDF(20页,短语级结构树→应降级启发式)
+    覆盖:结构树粒度检测降级、加粗短行标题识别。
+    """
+    import tempfile
+    pdf_path = os.path.join(os.path.dirname(TEST_DIR), "samples", "抱朴-藏象輔導課30.pdf")
+    if not os.path.isfile(pdf_path):
+        print("\n⚠️ 藏象样例不存在,跳过")
+        return
+    docx_path = os.path.join(TEST_DIR, "sample_zangxiang.docx")
+    img_dir = tempfile.mkdtemp()
+    result = convert_pdf_to_docx(pdf_path, docx_path, font_size_label="三号", image_dir=img_dir)
+    d = Document(docx_path)
+    paras_text = [x.text.strip() for x in d.paragraphs if x.text.strip()]
+    all_text = "\n".join(paras_text)
+    # 标题独立(加粗短行识别)
+    assert any("課程回顧" in t for t in paras_text), "标题'課程回顧'被合并"
+    assert any(t == "定性" for t in paras_text), "标题'定性'缺失"
+    # 正文段落完整
+    assert "州都之官，津液藏焉，氣化則能出矣" in all_text, "正文内容缺失"
+    # 字号统一16pt(标题不放大)
+    for x in d.paragraphs:
+        if not x.text.strip():
+            continue
+        size = max((rr.font.size.pt if rr.font.size else 0) for rr in x.runs)
+        assert abs(size - 16) < 0.5, f"字号异常: {size}pt ({x.text[:20]})"
+    os.remove(docx_path)
+    print(f"\n✅ 藏象样例测试通过: {result['paragraphs']} 段(降级启发式), 标题独立+全16pt")
+
+
 if __name__ == "__main__":
     main()
     test_images()
     test_realistic_docx()
     test_ear_docx()
     test_font_signal()
+    test_zangxiang_docx()

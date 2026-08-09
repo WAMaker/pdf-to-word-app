@@ -453,12 +453,16 @@ def _same_paragraph(prev: TextLine, cur: TextLine, para_gap: float, line_gap: fl
     if cur.bbox[0] - prev.bbox[0] > 12:
         return False
 
-    # 3) 加粗短行(标题行特征):上一行加粗且明显比当前行短(<60%)→ 新段
+    # 3) 加粗短行(标题行特征) → 新段:
+    # 上一行加粗且明显比当前行短(<60%)(标题后跟正文)
+    # 或 当前行加粗且明显比上一行短(<60%)(正文后跟标题)
     # 注意:长行加粗→不粗多为段内强调(如穴位名),不在此列
-    if prev.bold:
-        prev_width = prev.bbox[2] - prev.bbox[0]
-        cur_width = cur.bbox[2] - cur.bbox[0]
-        if prev_width > 0 and prev_width < cur_width * 0.6:
+    prev_width = prev.bbox[2] - prev.bbox[0]
+    cur_width = cur.bbox[2] - cur.bbox[0]
+    if prev_width > 0 and cur_width > 0:
+        if prev.bold and prev_width < cur_width * 0.6:
+            return False
+        if cur.bold and cur_width < prev_width * 0.6:
             return False
 
     # 4) 默认:同一段落
@@ -632,6 +636,55 @@ def _norm_for_match(s: str) -> str:
     return s
 
 
+def _extract_mcid_text(pdf: fitz.Document) -> dict:
+    """解析所有页内容流,构建 MCID → 文本 映射。
+    用于无 ActualText 的 Tagged PDF:Span 的 /K [MCID] 引用内容流标记。
+    返回 {mcid: text},MCID 按页编号(ParentTree 的 Nums 全文档连续)。
+    """
+    mcid_text: dict = {}
+    offset = 0
+    for pno in range(pdf.page_count):
+        page = pdf[pno]
+        for xref in page.get_contents():
+            try:
+                stream = pdf.xref_stream(xref)
+            except Exception:  # noqa: BLE001
+                continue
+            if not stream:
+                continue
+            s = stream.decode("latin1", errors="replace")
+            for mm in re.finditer(
+                r"/Span\s*<</MCID\s+(\d+)[^>]*>>\s*BDC(.*?)EMC", s, re.S
+            ):
+                mcid = int(mm.group(1))
+                body = mm.group(2)
+                text = _tj_text(body)
+                if text:
+                    mcid_text[mcid] = text
+    return mcid_text
+
+
+def _tj_text(bt_body: str) -> str:
+    """从 BT 块提取 TJ/Tj 文本(支持 hex 和字面量)"""
+    parts: List[str] = []
+    for arr in re.findall(r"\[(.*?)\]\s*TJ", bt_body, re.S):
+        for tok in re.findall(r"<([0-9A-Fa-f]+)>|\(([^)]*)\)", arr):
+            if tok[0]:
+                try:
+                    hexs = tok[0]
+                    if len(hexs) % 4 == 0:
+                        parts.append(bytes.fromhex(hexs).decode("utf-16-be", errors="replace"))
+                    else:
+                        parts.append(bytes.fromhex(hexs).decode("latin1", errors="replace"))
+                except Exception:  # noqa: BLE001
+                    pass
+            elif tok[1]:
+                parts.append(tok[1])
+    if parts:
+        return "".join(parts)
+    return "".join(re.findall(r"\(([^)]*)\)\s*Tj", bt_body))
+
+
 def _extract_structured_paragraphs(pdf: fitz.Document,
                                    font_map: Optional[dict] = None) -> Optional[List[StructPara]]:
     """从 Tagged PDF 结构树提取作者真实段落。
@@ -680,9 +733,28 @@ def _extract_structured_paragraphs(pdf: fitz.Document,
     page_lines_cache: dict = {}
     for pi in range(pdf.page_count):
         page_lines_cache[pi] = _extract_lines(pdf[pi], font_map)
+    # 每页 fitz span 文本序列(按内容流顺序,用于无 ActualText 的 Tagged PDF)
+    page_spans: dict = {}
+    for pi in range(pdf.page_count):
+        d = pdf[pi].get_text("dict")
+        seq = []
+        for block in d["blocks"]:
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for s in line.get("spans", []):
+                    t = s.get("text", "").strip()
+                    if t:
+                        seq.append(t)
+        page_spans[pi] = seq
 
-    def _elem_text(elem_xref: int, depth: int = 0) -> str:
-        """递归提取元素文本(聚合所有后代 Span 的 ActualText)"""
+    # 结构树 Span 元素按 (页, 出现顺序) 消费 fitz span 文本
+    span_cursor: dict = {}  # page_index -> 下一个消费位置
+
+    def _elem_text(elem_xref: int, page_index: int = 0, depth: int = 0) -> str:
+        """递归提取元素文本(聚合所有后代 Span 的 ActualText)
+        :param page_index: 元素所在页(用于无 ActualText 时按顺序消费 fitz span)
+        """
         if depth > 15:
             return ""
         try:
@@ -698,6 +770,13 @@ def _extract_structured_paragraphs(pdf: fitz.Document,
             atext_m = re.search(r"/ActualText\s+([^\s/]+)", obj)
             if atext_m:
                 text += _decode_actualtext(atext_m.group(1))
+            else:
+                # 无 ActualText:按 (页, 出现顺序) 消费 fitz span 文本
+                seq = page_spans.get(page_index, [])
+                cur = span_cursor.get(page_index, 0)
+                if cur < len(seq):
+                    text += seq[cur]
+                    span_cursor[page_index] = cur + 1
         # 递归子节点:只取 /K 数组中的引用(排除 /P 父引用、/Pg 页面引用)
         kids = []
         km = re.search(r"/K\s*\[([^\]]*)\]", obj)
@@ -706,7 +785,7 @@ def _extract_structured_paragraphs(pdf: fitz.Document,
         for sk in kids:
             if sk == elem_xref:
                 continue
-            text += _elem_text(sk, depth + 1)
+            text += _elem_text(sk, page_index, depth + 1)
         return text
 
     def _walk(elem_xref: int, depth: int = 0):
@@ -728,7 +807,7 @@ def _extract_structured_paragraphs(pdf: fitz.Document,
         # 段落类型:输出并聚合文本
         is_para_type = stype in ("P", "H", "H1", "H2", "H3", "Title", "LI", "LBody")
         if is_para_type:
-            text = _elem_text(elem_xref, depth + 1)
+            text = _elem_text(elem_xref, page_index, depth + 1)
             text = re.sub(r"\s*\n\s*", "", text)
             text = re.sub(r"[ \t]{2,}", " ", text).strip()
             # 清理 Word 导出残留括号(圆括号为导出标记;方括号是原文题目标记,保留)
@@ -885,14 +964,12 @@ def add_paragraph(doc: Document, para: Paragraph, font_name: str, base_size: flo
     if para.indent_left > 0:
         pf.left_indent = Pt(para.indent_left)
 
-    # 样式相关字号
-    # 结构树模式(struct_path=True)忠实 PDF 样式:标题不放大字号,
-    # 加粗由字体决定;启发式模式保留标题放大(老行为)
+    # 样式相关字号:标题不放大字号(忠实 PDF 样式,加粗由字体决定)
     if para.style == "title":
-        size = base_size if struct_path else max(base_size * 1.8, 26)
+        size = base_size
         bold = True
     elif para.style == "heading":
-        size = base_size if struct_path else max(base_size * 1.4, 18)
+        size = base_size
         bold = True
     else:
         size = base_size
@@ -974,6 +1051,17 @@ def convert_pdf_to_docx(
     # 文档级字体加粗映射(多信号源:字体名+FontDescriptor+相对比较)
     font_map = _analyze_fonts(pdf)
     struct_paras = _extract_structured_paragraphs(pdf, font_map)
+    # 结构树粒度检测:段落级结构树的 P 大多以句末标点结尾;
+    # 短语级结构树(如藏象PDF,P 是短语而非段落)结尾标点比例低,
+    # 直接输出会得到碎片段,此时降级到启发式段落重建
+    if struct_paras:
+        _SENT_END_DETECT = re.compile(r"[。！？!?；;：:\”’」』）)]$")
+        end_count = sum(
+            1 for p in struct_paras if _SENT_END_DETECT.search(p.text.strip())
+        )
+        end_ratio = end_count / max(len(struct_paras), 1)
+        if end_ratio < 0.4:
+            struct_paras = None
     used_struct = struct_paras is not None
 
     try:
