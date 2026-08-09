@@ -28,7 +28,12 @@ jobs:
           pip install pyinstaller
 
       - name: Build EXE
+        shell: bash
         run: |
+          # 把 tag 版本号写入 APP_VERSION(保持 exe 内版本与 tag 同步)
+          VERSION="v${GITHUB_REF_NAME#v}"
+          if [ "$VERSION" = "v" ]; then VERSION="v1.4.0"; fi
+          python -c "import re,pathlib; p=pathlib.Path('app/main.py'); s=p.read_text(); s=re.sub(r'APP_VERSION = \\"v[^\\"]*\\"', f'APP_VERSION = \\"{VERSION}\"', s); p.write_text(s)"
           pyinstaller --noconfirm --onefile --windowed --name "PDF转Word" run_app.py
 
       - name: Upload artifact

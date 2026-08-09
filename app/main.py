@@ -62,7 +62,8 @@ APP_ORG = "PDF2Word"
 APP_SETTINGS_KEY = "pdf2word"
 GITHUB_REPO = "WAMaker/pdf-to-word-app"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-
+# 当前版本(打包 workflow 会替换此行保持同步)
+APP_VERSION = "v1.4.0"
 # 预览样式对应关系
 _STYLE_TAG = {
     "title": "h1",
@@ -102,8 +103,8 @@ class ConvertThread(QThread):
 
 class UpdateThread(QThread):
     """后台检查 GitHub 最新版本"""
-    ok = Signal(str, str)       # (最新版本号, 下载页URL)
-    failed = Signal(str)        # 错误信息(网络/解析等)
+    ok = Signal(str, str, str, int)  # (最新版本号, 下载页URL, exe下载URL, 文件大小bytes)
+    failed = Signal(str)             # 错误信息(网络/解析等)
 
     def __init__(self, current_version: str):
         super().__init__()
@@ -122,9 +123,57 @@ class UpdateThread(QThread):
                 self.failed.emit("无法获取版本信息,请稍后再试")
                 return
             url = data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases"
-            self.ok.emit(latest, url)
+            # 找 exe 资产(下载更新用)
+            asset_url = ""
+            asset_size = 0
+            for asset in (data.get("assets") or []):
+                name = (asset.get("name") or "").lower()
+                if name.endswith(".exe") and not name.endswith(".exe.asc"):
+                    asset_url = asset.get("browser_download_url") or ""
+                    asset_size = int(asset.get("size") or 0)
+                    break
+            self.ok.emit(latest, url, asset_url, asset_size)
         except Exception as e:  # noqa: BLE001
             self.failed.emit(f"检查更新失败(网络或服务器问题),请稍后再试\n{type(e).__name__}")
+
+
+class DownloadThread(QThread):
+    """后台下载更新包,带进度"""
+    progress = Signal(int, int)  # (已下载bytes, 总bytes)
+    finished_ok = Signal(str)    # 下载完成,返回本地临时文件路径
+    failed = Signal(str)
+
+    def __init__(self, url: str, dest_path: str):
+        super().__init__()
+        self.url = url
+        self.dest_path = dest_path
+
+    def run(self):
+        try:
+            req = urllib.request.Request(
+                self.url,
+                headers={"User-Agent": "PDF2Word-Updater"},
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                total = int(resp.headers.get("Content-Length") or 0)
+                downloaded = 0
+                with open(self.dest_path, "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        self.progress.emit(downloaded, total)
+            self.finished_ok.emit(self.dest_path)
+        except Exception as e:  # noqa: BLE001
+            # 清理半成品
+            try:
+                if os.path.exists(self.dest_path):
+                    os.remove(self.dest_path)
+            except Exception:  # noqa: BLE001
+                pass
+            self.failed.emit(f"下载失败(网络或服务器问题),请稍后再试\n{type(e).__name__}")
 
 
 class MainWindow(QMainWindow):
@@ -135,6 +184,7 @@ class MainWindow(QMainWindow):
         self.selected_pdf: str | None = None
         self.thread: ConvertThread | None = None
         self.update_thread: UpdateThread | None = None
+        self.download_thread: DownloadThread | None = None
         self.last_result: dict | None = None
         self.preview_temp_dir = tempfile.mkdtemp(prefix="pdf2word_")
         # 记住用户的字体/字号选项(QSettings 持久化)
@@ -144,7 +194,7 @@ class MainWindow(QMainWindow):
         self.selected_size = saved_size if saved_size in FONT_SIZES else "三号"
         self.selected_font = saved_font if saved_font in FONTS else "微软雅黑"
         # 当前版本(更新检查用;打包时由构建脚本写入)
-        self.app_version = getattr(sys, "frozen", False) and "v1.3.3" or "v1.3.3"
+        self.app_version = APP_VERSION
 
         self._build_ui()
         self._apply_fonts()
@@ -401,7 +451,7 @@ class MainWindow(QMainWindow):
         self._clear_preview()
 
     # ------------------------------------------------------------------
-    # 检查更新:去 GitHub 查最新版本
+    # 检查更新:去 GitHub 查最新版本,下载并替换当前 exe
     # ------------------------------------------------------------------
     def check_update(self):
         if self.update_thread and self.update_thread.isRunning():
@@ -414,26 +464,136 @@ class MainWindow(QMainWindow):
         self.update_thread.finished.connect(self.on_update_done)
         self.update_thread.start()
 
-    def on_update_ok(self, latest: str, url: str):
+    def on_update_ok(self, latest: str, url: str, asset_url: str, asset_size: int):
         cur = self.app_version
         if latest.lower().lstrip("v") == cur.lower().lstrip("v"):
             QMessageBox.information(self, "检查更新", f"当前已是最新版本 ({cur}) ✓")
+            return
+        if not asset_url:
+            QMessageBox.information(
+                self, "发现新版本",
+                f"发现新版本 {latest}\n当前版本 {cur}\n\n该版本未提供 exe 安装包,可打开下载页获取。",
+            )
+            return
+        size_txt = f"{asset_size / 1024 / 1024:.1f} MB" if asset_size else ""
+        box = QMessageBox(self)
+        box.setWindowTitle("发现新版本")
+        box.setText(
+            f"发现新版本 {latest}\n当前版本 {cur}\n安装包大小:{size_txt}\n\n是否现在下载并更新?"
+        )
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.button(QMessageBox.Yes).setText("下载更新")
+        box.button(QMessageBox.No).setText("稍后再说")
+        if box.exec() == QMessageBox.Yes:
+            self._start_download(latest, asset_url)
+
+    def _start_download(self, latest: str, asset_url: str):
+        """开始下载更新包(带进度条)"""
+        dest = os.path.join(tempfile.gettempdir(), f"pdf2word_update_{latest}.exe")
+        self.status_label.setText(f"正在下载更新 {latest} …")
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("下载中…")
+        self.download_thread = DownloadThread(asset_url, dest)
+        self.download_thread.progress.connect(self.on_download_progress)
+        self.download_thread.finished_ok.connect(self.on_download_done)
+        self.download_thread.failed.connect(self.on_download_fail)
+        self.download_thread.start()
+
+    def on_download_progress(self, downloaded: int, total: int):
+        if total > 0:
+            pct = int(downloaded / total * 100)
+            self.progress.setValue(pct)
+            mb_d = downloaded / 1024 / 1024
+            mb_t = total / 1024 / 1024
+            self.status_label.setText(f"正在下载更新… {pct}% ({mb_d:.1f}/{mb_t:.1f} MB)")
         else:
-            box = QMessageBox(self)
-            box.setWindowTitle("发现新版本")
-            box.setText(f"发现新版本 {latest}\n当前版本 {cur}\n\n是否打开下载页面?")
-            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-            box.button(QMessageBox.Yes).setText("打开下载页")
-            box.button(QMessageBox.No).setText("稍后再说")
-            if box.exec() == QMessageBox.Yes:
-                QDesktopServices.openUrl(QUrl(url))
+            self.progress.setValue(0)
+            self.status_label.setText("正在下载更新…")
 
-    def on_update_fail(self, msg: str):
-        QMessageBox.warning(self, "检查更新", msg)
+    def on_download_done(self, file_path: str):
+        self.progress.setValue(100)
+        self.status_label.setText("下载完成")
+        self._confirm_replace(file_path)
 
-    def on_update_done(self):
-        self.update_btn.setEnabled(True)
-        self.update_btn.setText("🔄  检查更新")
+    def on_download_fail(self, msg: str):
+        self.progress.setVisible(False)
+        self.status_label.setText("")
+        QMessageBox.warning(self, "更新失败", msg)
+
+    def _confirm_replace(self, downloaded_exe: str):
+        """确认替换当前 exe(替换后自动重启新版本)"""
+        if not getattr(sys, "frozen", False):
+            # 源码运行(非打包 exe):无法自动替换,提示手动
+            QMessageBox.information(
+                self, "更新",
+                f"下载完成: {downloaded_exe}\n\n当前为源码运行,请手动替换 exe 文件。",
+            )
+            self.progress.setVisible(False)
+            return
+        cur_exe = os.path.abspath(sys.executable)
+        box = QMessageBox(self)
+        box.setWindowTitle("更新")
+        box.setText(
+            f"新版本已下载完成。\n\n将替换当前程序:\n{cur_exe}\n\n替换后会自动启动新版本,继续吗?"
+        )
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.button(QMessageBox.Yes).setText("替换并重启")
+        box.button(QMessageBox.No).setText("取消")
+        if box.exec() == QMessageBox.Yes:
+            self._do_replace(downloaded_exe, cur_exe)
+        else:
+            self.progress.setVisible(False)
+            QMessageBox.information(
+                self, "更新",
+                f"新版本已保存到:\n{downloaded_exe}\n\n下次可直接用它替换旧版。",
+            )
+
+    def _do_replace(self, downloaded_exe: str, cur_exe: str):
+        """执行替换:写批处理脚本等待进程退出后覆盖 exe 并重启"""
+        if sys.platform != "win32":
+            QMessageBox.information(
+                self, "更新",
+                f"新版本已保存到:\n{downloaded_exe}\n\n当前系统不支持自动替换,请手动替换。",
+            )
+            self.progress.setVisible(False)
+            return
+        try:
+            exe_dir = os.path.dirname(cur_exe)
+            new_name = os.path.basename(cur_exe)
+            staged = os.path.join(exe_dir, f"{new_name}.new")
+            # 把下载的 exe 复制到程序目录(避免临时目录权限/清理问题)
+            import shutil
+            shutil.copy2(downloaded_exe, staged)
+            # 批处理:等待旧进程退出 → 覆盖 → 启动新版 → 清理
+            bat_path = os.path.join(exe_dir, "_update_apply.bat")
+            exe_name = os.path.basename(cur_exe)
+            with open(bat_path, "w", encoding="gbk", errors="replace") as f:
+                f.write('@echo off\r\n')
+                f.write('chcp 65001 >nul\r\n')
+                f.write(f'title Updating {APP_TITLE}...\r\n')
+                f.write(f'set "OLD={cur_exe}"\r\n')
+                f.write(f'set "NEW={staged}"\r\n')
+                f.write(':wait\r\n')
+                # 等主程序退出(找不到该进程名即已退出)
+                f.write(f'tasklist /FI "IMAGENAME eq {exe_name}" 2>nul | find /I "{exe_name}" >nul 2>&1\r\n')
+                f.write('if not errorlevel 1 (timeout /t 2 /nobreak >nul & goto wait)\r\n')
+                f.write('copy /Y "%NEW%" "%OLD%" >nul\r\n')
+                f.write('if errorlevel 1 (echo 替换失败 & pause & exit /b 1)\r\n')
+                f.write('del /F /Q "%NEW%"\r\n')
+                f.write('del /F /Q "%~f0"\r\n')
+                f.write(f'start "" "{cur_exe}"\r\n')
+            os.startfile(bat_path)  # noqa: S606
+            # 提示后退出(批处理会完成替换并重启)
+            QMessageBox.information(
+                self, "更新", "正在替换程序,窗口将关闭。\n新版本会自动启动。"
+            )
+            QApplication.instance().quit()
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "更新失败", f"替换失败:\n{e}\n\n新版本已保存到:\n{downloaded_exe}")
+            self.progress.setVisible(False)
 
     def _refresh_size_buttons(self):
         for label, btn in self.size_buttons.items():
