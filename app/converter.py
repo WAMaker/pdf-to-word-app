@@ -339,9 +339,10 @@ def _same_paragraph(prev: TextLine, cur: TextLine, para_gap: float, line_gap: fl
 
     # 2) 当前行有显著左缩进(>12pt),通常是新段落(如正文首行缩进)
     if cur.bbox[0] - prev.bbox[0] > 12:
-        # 例外:上一行以冒号/破折号等引导性标点结尾 → 列举引导语,续行合并
+        # 例外:上一行是不加粗的引导语(冒号/破折号结尾)→ 列举引导语,续行合并
+        # (如 '...功能：' + '第一，...';加粗的标题/题目如 '第一部分：...' 仍断段)
         prev_tail = prev.text.rstrip()
-        if prev_tail.endswith(("：", ":", "——", "—", "“")):
+        if not prev.bold and prev_tail.endswith(("：", ":", "——", "—", "“")):
             return True
         return False
 
@@ -352,6 +353,15 @@ def _same_paragraph(prev: TextLine, cur: TextLine, para_gap: float, line_gap: fl
         if prev.list_marker and not _is_para_complete_line(prev) and len(prev.text) > 25:
             return True
         return False
+
+    # 2c) 短加粗行(标题) → 新段:上一行加粗且明显比当前行短(<60%)
+    # (如 '第一部分：...'(粗短) + 正文; '第二部分 作業講解'(粗短) + '1.[單選題]'(粗长))
+    # 注意:长行加粗→不粗多为段内强调(如穴位名),不在此列
+    if prev.bold:
+        prev_width = prev.bbox[2] - prev.bbox[0]
+        cur_width = cur.bbox[2] - cur.bbox[0]
+        if prev_width > 0 and prev_width < cur_width * 0.6:
+            return False
 
     # 3) 默认:同一段落
     return True

@@ -244,6 +244,9 @@ def test_ear_docx():
     assert "再找到四區邊界" in all_text.replace("\n", ""), "列表引导语跨行未合并"
     # 完整独立列表项保持独立
     assert "定六區：對耳輪上腳所連接的區域是耳輪六區。" in all_text, "完整列表项被误合并"
+    # 章节标题(冒号结尾的加粗短行)应独立,不被引导语合并逻辑吞并
+    assert "第一部分：耳診課內容回顧" in all_text, "章节标题'第一部分'被误合并"
+    assert "第二部分 作業講解" in all_text, "章节标题'作業講解'被误合并"
     os.remove(docx_path)
     print(f"\n✅ 耳诊样例测试通过: {result['paragraphs']} 段, {result['images']} 图")
 
