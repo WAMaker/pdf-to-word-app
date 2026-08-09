@@ -38,9 +38,6 @@ class TextLine:
     font: str
     bold: bool
     align: Optional[str]  # 'left' | 'center' | 'right' | 'justify' | None
-    block_id: int = 0     # 所属 PDF 文本块 ID(辅助段落判断)
-    list_marker: bool = False  # 是否以列表符开头(如 'l '、'1.'、'•')→ 通常是列表项/小标题
-    option_marker: bool = False  # 是否以选项字母开头(如 'A.' 'B.')→ 选择题选项,独立成段
     spans: List[Tuple[str, bool]] = field(default_factory=list)  # (文本, 加粗) 行内分段样式
 
     def __post_init__(self):
@@ -111,15 +108,6 @@ def _is_cjk_text(text: str) -> bool:
 
 
 _LIST_MARKER_RE = re.compile(r"^(?:[l1iI•·▪●]|[0-9]{1,2}[.、.)])\s+")
-_OPTION_MARKER_RE = re.compile(r"^[A-D][.、．]\s*")
-_ENUM_ITEM_RE = re.compile(r"^第[一二三四五六七八九十百]+[，,、：]")
-_ANSWER_MARKER_RE = re.compile(r"^[\[【]?答案[\]】]?[:：]?\s*[A-D]?")
-
-
-
-def _is_option_marker_line(raw: str) -> bool:
-    """判断是否选择题选项行(如 'A. 即耳輪3 區...')"""
-    return bool(_OPTION_MARKER_RE.match(raw.strip()))
 
 
 def _clean_text(s: str) -> str:
@@ -139,11 +127,6 @@ def _clean_text(s: str) -> str:
     if re.fullmatch(r"[l1iI•·▪●]", s):
         return ""
     return s
-
-
-def _is_list_marker_line(raw: str) -> bool:
-    """判断原始文本行是否以列表符开头(用于段落边界识别)"""
-    return bool(_LIST_MARKER_RE.match(raw.strip()))
 
 
 def _is_blank_line(s: str) -> bool:
@@ -242,9 +225,6 @@ def _extract_lines(page: fitz.Page) -> List[TextLine]:
                 font=max(fonts, key=fonts.count),
                 bold=bold,
                 align=_detect_align(line, page.rect.width),
-                block_id=block.get("number", 0),
-                list_marker=_is_list_marker_line(raw),
-                option_marker=_is_option_marker_line(raw),
                 spans=span_styles,
             ))
     return lines
@@ -273,38 +253,22 @@ def _detect_align(line, page_width: float) -> str:
 
 def _infer_style(line: TextLine, is_first: bool, para_lines: List[TextLine],
                  body_size: float = 0.0) -> str:
-    """推断段落样式:标题 / 小标题 / 正文
-    策略:基于相对字号(与正文字号比较)+ 加粗 + 文本长度 + 段落结构
-    不依赖绝对字号阈值,适应不同文档的字体大小习惯。
+    """推断段落样式:标题 / 小标题 / 正文(启发式路径用)
+    策略:只使用 PDF 结构化样式信号——相对字号(与正文字号比较)、
+    加粗(字体名)、单行长度、段落结构;不做内容特判。
     :param body_size: 页面正文字号估计(0 表示未知,退回绝对阈值)
     :param is_first: 是否全文档第一个非空文本段落(课程/文档大标题通常在此)
     """
     para_text = "".join(l.text for l in para_lines)
     para_len = len(para_text.strip())
-    # 以句末标点(含分号/顿号/冒号,列表项)结尾的通常是正文/列表项,不是标题
+    # 以句末标点结尾的通常是正文/完整句子,不是标题
     ends_with_punct = para_text.rstrip().endswith((
         "。", ".", "！", "？", "!", "?", "，", ",", "；", ";", "、", "：", ":",
     ))
-    # 选择题选项行(A./B./C./D. 开头)永远是正文,不是标题
-    if line.option_marker:
-        return "body"
-    # 以'A.'/'B.'等选项字母开头的段落也是选项(结构树清理后可能丢 option_marker)
-    if re.match(r"^[A-D][.、．]\s*", para_text.strip()):
-        return "body"
-    # 答案行([答案]X / 答案：X)是正文,不是标题
-    if re.match(r"^[\[【]?答案[\]】]?[:：]?", para_text.strip()):
-        return "body"
-    # 题目行(多選題/單選題/問答題 开头)是小标题
-    if re.match(r"^[\[【]?(單選題|多選題|判斷題|簡答題|問答題)", para_text.strip()):
-        return "heading"
 
     # 全文档首段 + 加粗 + 单行 + 短文本 → 大标题(如课程标题)
     if is_first and line.bold and len(para_lines) == 1 and para_len <= 40:
         return "title"
-
-    # 列表符开头且加粗且短 → 列表项小标题(如 'l 胃經腹部重點穴位診斷作用及功能複習')
-    if line.list_marker and line.bold and para_len <= 30 and not ends_with_punct:
-        return "heading"
 
     # 绝对阈值兜底:超大字号必为标题
     if line.size >= 20:
@@ -351,15 +315,14 @@ def _estimate_body_size(lines: List[TextLine]) -> float:
 
 
 def _same_paragraph(prev: TextLine, cur: TextLine, para_gap: float, line_gap: float) -> bool:
-    """判断两行是否属于同一逻辑段落(核心算法)
+    """判断两行是否属于同一逻辑段落(启发式路径,仅用于非 Tagged PDF)
     :param para_gap: 段落间距阈值(动态计算,pt)
     :param line_gap: 行内间距基准(pt,取中位数)
-    段落边界识别策略(按优先级):
+    段落边界识别只使用 PDF 结构化信号(布局/样式属性),不做内容特判:
     1. 行距显著大于行内基准 → 新段(真实的段间距)
-    2. 当前行比上一行明显右移(>12pt)→ 新段(首行缩进,最常见的段界标志);
-       但上一行以冒号/破折号/引号引导结尾(列举引导语)时除外——
-       如 '...功能：' + '第一，它能治療...' 是同一段。
-    3. 其余情况合并为同一段。
+    2. 当前行比上一行明显右移(>12pt)→ 新段(首行缩进,最常见的段界标志)
+    3. 加粗→不加粗 且 上一行明显短(<60%当前行宽)→ 新段(标题行特征)
+    4. 其余情况合并为同一段。
     注意:不依赖 PDF 文本块 ID(同一段经常被拆成多个 block),
     也不在浮点边缘比较行距(有的行距 16.7、有的 16.8,阈值取中位数会误判)。
     """
@@ -370,44 +333,11 @@ def _same_paragraph(prev: TextLine, cur: TextLine, para_gap: float, line_gap: fl
     if gap > para_gap:
         return False
 
-    # 2a) 引导语续行:上一行是不加粗引导语(冒号/破折号结尾),
-    # 且当前行是长行(≥60%上一行宽,段内列举如 '功能：第一，它能治療...')
-    # → 合并(即使右移);当前行是短行(独立列表项如 '第一，耳舟，對應上肢；')→ 断段
-    prev_tail = prev.text.rstrip()
-    if not prev.bold and prev_tail.endswith(("：", ":", "——", "—", "“")):
-        prev_w = prev.bbox[2] - prev.bbox[0]
-        cur_w = cur.bbox[2] - cur.bbox[0]
-        if prev_w > 0 and cur_w >= prev_w * 0.6:
-            return True
-        return False
-
     # 2) 当前行有显著左缩进(>12pt),通常是新段落(如正文首行缩进)
     if cur.bbox[0] - prev.bbox[0] > 12:
         return False
 
-    # 2b) 当前行或上一行以列表符开头(如 'l 胃經腹部...'、'1. xxx')→ 列表项/小标题,必为新段
-    if cur.list_marker or prev.list_marker:
-        # 例外:列表项引导语跨行(如 '• 定一區：...耳甲' 后接 '的橫向突起...')
-        # 条件:上一行是列表项 且 行尾非句末标点 且 行较长(>25字,是内容被截断而非短标题)
-        if prev.list_marker and not _is_para_complete_line(prev) and len(prev.text) > 25:
-            return True
-        return False
-
-    # 2b2) 选择题选项行(如 'A. 即耳輪3 區...')→ 独立成段
-    if cur.option_marker:
-        return False
-
-    # 2b2b) 答案行(如 '[答案]D'、'答案：D')→ 独立成段
-    if cur.text.strip() and _ANSWER_MARKER_RE.match(cur.text.strip()):
-        return False
-
-    # 2b3) 短列表项行(如 '第一，耳舟，對應上肢；' w<300pt)→ 独立成段
-    # 耳诊式列表(每项一行);经络式列举(长行连续排版)不受影响
-    if _ENUM_ITEM_RE.match(cur.text) and (cur.bbox[2] - cur.bbox[0]) < 300:
-        return False
-
-    # 2c) 短加粗行(标题) → 新段:上一行加粗且明显比当前行短(<60%)
-    # (如 '第一部分：...'(粗短) + 正文; '第二部分 作業講解'(粗短) + '1.[單選題]'(粗长))
+    # 3) 加粗短行(标题行特征):上一行加粗且明显比当前行短(<60%)→ 新段
     # 注意:长行加粗→不粗多为段内强调(如穴位名),不在此列
     if prev.bold:
         prev_width = prev.bbox[2] - prev.bbox[0]
@@ -415,7 +345,7 @@ def _same_paragraph(prev: TextLine, cur: TextLine, para_gap: float, line_gap: fl
         if prev_width > 0 and prev_width < cur_width * 0.6:
             return False
 
-    # 3) 默认:同一段落
+    # 4) 默认:同一段落
     return True
 
 
@@ -669,6 +599,12 @@ def _merge_struct_with_lines(struct_paras: List[StructPara], pdf: fitz.Document)
 def _extract_structured_paragraphs(pdf: fitz.Document) -> Optional[List[StructPara]]:
     """从 Tagged PDF 结构树提取作者真实段落。
     返回 None 表示该 PDF 无结构树(退回启发式段落重建)。
+    递归遍历结构树,支持:
+    - P/H1-H3/Title → 段落
+    - L(列表容器) → 递归进 LI(列表项)
+    - LI/LBody → 列表项段落
+    - Span → 文本片段(ActualText)
+    完全依赖结构标签,不做内容特判。
     """
     # 1. 找 StructTreeRoot
     root = None
@@ -690,75 +626,89 @@ def _extract_structured_paragraphs(pdf: fitz.Document) -> Optional[List[StructPa
         if not m:
             return None
         doc_elem = int(m.group(1))
-        doc_obj = pdf.xref_object(doc_elem, compressed=False)
-        kid_xrefs = [int(x) for x in re.findall(r"(\d+)\s+0\s+R", doc_obj)]
     except Exception:  # noqa: BLE001
         return None
 
     paras: List[StructPara] = []
-    for k in kid_xrefs:
-        if k == doc_elem:
-            continue
+
+    def _page_of(page_xref: Optional[int]) -> int:
+        if not page_xref:
+            return 0
+        for pi in range(pdf.page_count):
+            if pdf[pi].xref == page_xref:
+                return pi
+        return 0
+
+    def _elem_text(elem_xref: int, depth: int = 0) -> str:
+        """递归提取元素文本(聚合所有后代 Span 的 ActualText)"""
+        if depth > 15:
+            return ""
         try:
-            obj = pdf.xref_object(k, compressed=False)
+            obj = pdf.xref_object(elem_xref, compressed=False)
         except Exception:  # noqa: BLE001
-            continue
+            return ""
         if "/StructElem" not in obj:
-            continue
+            return ""
         sm = re.search(r"/S\s+/(\w+)", obj)
-        stype = sm.group(1) if sm else "P"
-        if stype not in ("P", "H", "H1", "H2", "H3", "Title", "LI", "LBody", "L"):
-            continue
+        stype = sm.group(1) if sm else "?"
+        text = ""
+        if stype == "Span":
+            atext_m = re.search(r"/ActualText\s+([^\s/]+)", obj)
+            if atext_m:
+                text += _decode_actualtext(atext_m.group(1))
+        # 递归子节点:只取 /K 数组中的引用(排除 /P 父引用、/Pg 页面引用)
+        kids = []
+        km = re.search(r"/K\s*\[([^\]]*)\]", obj)
+        if km:
+            kids = [int(x) for x in re.findall(r"(\d+)\s+0\s+R", km.group(1))]
+        for sk in kids:
+            if sk == elem_xref:
+                continue
+            text += _elem_text(sk, depth + 1)
+        return text
+
+    def _walk(elem_xref: int, depth: int = 0):
+        """递归遍历结构树,输出段落"""
+        if depth > 15:
+            return
+        try:
+            obj = pdf.xref_object(elem_xref, compressed=False)
+        except Exception:  # noqa: BLE001
+            return
+        if "/StructElem" not in obj:
+            return
+        sm = re.search(r"/S\s+/(\w+)", obj)
+        stype = sm.group(1) if sm else "?"
         pgm = re.search(r"/Pg\s+(\d+)\s+0\s+R", obj)
         page_xref = int(pgm.group(1)) if pgm else None
-        page_index = 0
-        if page_xref:
-            for pi in range(pdf.page_count):
-                if pdf[pi].xref == page_xref:
-                    page_index = pi
-                    break
+        page_index = _page_of(page_xref)
 
-        text = ""
-        span_xrefs = [int(x) for x in re.findall(r"(\d+)\s+0\s+R", obj)]
-        for sx in span_xrefs:
-            if sx == k:
+        # 段落类型:输出并聚合文本
+        is_para_type = stype in ("P", "H", "H1", "H2", "H3", "Title", "LI", "LBody")
+        if is_para_type:
+            text = _elem_text(elem_xref, depth + 1)
+            text = re.sub(r"\s*\n\s*", "", text)
+            text = re.sub(r"[ \t]{2,}", " ", text).strip()
+            # 清理 Word 导出残留括号(圆括号为导出标记;方括号是原文题目标记,保留)
+            text = re.sub(r"[\(\)（）]", "", text)
+            text = _LIST_MARKER_RE.sub("", text)  # 清理列表符残留(如 'l 胃經腹部...')
+            text = text.strip()
+            if text:
+                paras.append(StructPara(text=text, type=stype, page_index=page_index))
+            # 段落元素文本已聚合,不递归输出子元素(避免 LBody 重复)
+            return
+
+        # 容器类型(L 列表/Sect 等):递归子节点(只取 /K 数组引用)
+        kids = []
+        km = re.search(r"/K\s*\[([^\]]*)\]", obj)
+        if km:
+            kids = [int(x) for x in re.findall(r"(\d+)\s+0\s+R", km.group(1))]
+        for sk in kids:
+            if sk == elem_xref:
                 continue
-            try:
-                sobj = pdf.xref_object(sx, compressed=False)
-            except Exception:  # noqa: BLE001
-                continue
-            if "/StructElem" not in sobj:
-                continue
-            ssm = re.search(r"/S\s+/(\w+)", sobj)
-            stype2 = ssm.group(1) if ssm else "?"
-            atext_m = re.search(r"/ActualText\s+([^\s/]+)", sobj)
-            if stype2 == "Span" and atext_m:
-                text += _decode_actualtext(atext_m.group(1))
-            # 嵌套 Span/LI(一层)
-            if stype2 in ("Span", "L", "LI"):
-                sub_xrefs = [int(x) for x in re.findall(r"(\d+)\s+0\s+R", sobj)]
-                for ssx in sub_xrefs:
-                    if ssx == sx:
-                        continue
-                    try:
-                        ssobj = pdf.xref_object(ssx, compressed=False)
-                    except Exception:  # noqa: BLE001
-                        continue
-                    if "/StructElem" not in ssobj:
-                        continue
-                    sat_m = re.search(r"/ActualText\s+([^\s/]+)", ssobj)
-                    if sat_m:
-                        text += _decode_actualtext(sat_m.group(1))
-        text = re.sub(r"[ \t]+\n", "\n", text)
-        text = re.sub(r"\n[ \t]+", "\n", text)
-        text = re.sub(r"\s*\n\s*", "", text)  # 段落内无换行
-        text = re.sub(r"[ \t]{2,}", " ", text).strip()
-        # 清理 Word 导出残留括号(圆括号为导出标记;方括号是原文题目标记,保留)
-        text = re.sub(r"[\(\)（）]", "", text)
-        text = _LIST_MARKER_RE.sub("", text)  # 清理列表符残留(如 'l 胃經腹部...')
-        text = text.strip()
-        if text:
-            paras.append(StructPara(text=text, type=stype, page_index=page_index))
+            _walk(sk, depth + 1)
+
+    _walk(doc_elem)
 
     if not paras:
         return None
@@ -911,29 +861,17 @@ def add_paragraph(doc: Document, para: Paragraph, font_name: str, base_size: flo
 
 _SENT_END_RE = re.compile(r"[。！？!?；;：:\”’」』）)]$")
 
-def _is_para_complete_line(line: TextLine) -> bool:
-    """判断单行是否以句末标点结束(完整行)"""
-    text = line.text.rstrip()
-    if not text:
-        return True
-    return bool(_SENT_END_RE.search(text))
-
-
 def _is_para_complete(para: Paragraph) -> bool:
     """判断段落是否以句末标点结束(完整段落)。
     以句号/感叹号/问号/冒号/引号等结尾 → 完整;
     标题/小标题样式(如 '胃經腹部重點穴位診斷作用及功能複習')虽无标点,
     但作为独立标题也是完整的,不参与跨页续接。
-    选项行('A. ...')、列表项行也视为完整,不跨页合并。
     """
     if para.image is not None:
         return True
     if para.style in ("title", "heading"):
         return True
     if not para.lines:
-        return True
-    first = para.lines[0]
-    if first.option_marker or first.list_marker:
         return True
     text = para.text.rstrip()
     if not text:
