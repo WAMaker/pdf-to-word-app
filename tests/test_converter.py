@@ -165,6 +165,14 @@ def test_realistic_docx():
     # 5) 插图保留
     assert result["images"] == 1, f"应保留 1 张插图,实际 {result['images']}"
 
+    # 6) 缩进:左缩进应为相对页面边距的额外缩进(PDF 左边距不应写入 left_indent)
+    from docx import Document as _Document
+    d = _Document(docx_path)
+    body_paras = [p for p in d.paragraphs if p.text.strip() and p.paragraph_format.first_line_indent]
+    assert body_paras, "未检测到首行缩进段落"
+    for p in body_paras[:5]:
+        li = p.paragraph_format.left_indent
+        assert li is None or li.pt < 10, f"左缩进异常(应≈0): {li.pt if li else None}pt"
     print(f"\n✅ 真实排版回归测试通过: {result['paragraphs']} 段, {result['images']} 图")
 
 

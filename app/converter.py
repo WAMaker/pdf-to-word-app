@@ -375,6 +375,9 @@ def rebuild_paragraphs(lines: List[TextLine], page_width: float, page_height: fl
     elements = _merge_elements(lines, images or [])
     para_gap, line_gap = _estimate_para_gap(lines)
 
+    # 页面内容区左边缘(即 PDF 页面左边距),用于计算相对缩进
+    page_left = min((l.bbox[0] for l in lines), default=0.0)
+
     for _, kind, obj in elements:
         if kind == "image":
             # 图片:先结束当前文本段落,再作为独立段落插入
@@ -426,7 +429,11 @@ def rebuild_paragraphs(lines: List[TextLine], page_width: float, page_height: fl
             indent = first_x0 - rest_x0
             if indent > 8:
                 para.indent_first = indent
-            para.indent_left = rest_x0
+            # 左缩进 = 相对页面左边距的额外缩进(PDF 绝对 x0 含页面边距,
+            # 直接写入 Word 会导致正文整体严重偏右)
+            extra_left = rest_x0 - page_left
+            if extra_left > 8:
+                para.indent_left = extra_left
 
     return paragraphs
 
