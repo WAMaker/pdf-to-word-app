@@ -516,86 +516,6 @@ def _norm_for_match(s: str) -> str:
     return s
 
 
-def _merge_struct_with_lines(struct_paras: List[StructPara], pdf: fitz.Document) -> List[StructPara]:
-    """结构树段落 + 页面行融合:补回结构树遗漏的文本(如编号列表项)
-    Word 导出 PDF 时,部分行(尤其列表项)在页面内容流里有文本,
-    但结构树 StructElem 未引用,纯结构树会丢内容。
-    策略:每页用行文本校验结构段落覆盖,未覆盖的行补充为独立段落。
-    """
-    # 每页行文本(规范化)
-    page_lines = {}
-    for i in range(pdf.page_count):
-        page_lines[i] = _extract_lines(pdf[i])
-
-    result: List[StructPara] = []
-    for sp in struct_paras:
-        result.append(sp)
-        # 检查该结构段落后是否有遗漏行(下一页前)
-        # 简化:逐页处理,对每页结构段落与行文本做差异补全
-
-    # 逐页重建:结构段落 + 补充遗漏行,保持顺序
-    by_page = {}
-    for sp in struct_paras:
-        by_page.setdefault(sp.page_index, []).append(sp)
-    merged: List[StructPara] = []
-    for pno in sorted(by_page.keys()):
-        sps = by_page[pno]
-        lines = page_lines.get(pno, [])
-        # 收集未覆盖行(结构树遗漏的文本,如项目符号列表项)
-        uncovered: List[TextLine] = []
-        for line in lines:
-            ln = _norm_for_match(line.text)
-            if not ln or len(ln) < 4:
-                continue
-            in_covered = False
-            for sp in sps:
-                if ln in _norm_for_match(sp.text) or _norm_for_match(sp.text) in ln:
-                    in_covered = True
-                    break
-            if not in_covered:
-                uncovered.append(line)
-        # 用启发式重建未覆盖行(合并跨行片段,如'定一區：...' + '的橫向突起...')
-        extra: List[StructPara] = []
-        if uncovered:
-            page_w = pdf[pno].rect.width
-            for para in rebuild_paragraphs(uncovered, page_w, 842.0, None):
-                if para.image is not None or not para.text.strip():
-                    continue
-                # 记录补充段的 y 位置(用于排序:取段落首行 y)
-                y_pos = para.lines[0].bbox[1] if para.lines else 0.0
-                sp2 = StructPara(
-                    text=para.text.strip(), type="P", page_index=pno,
-                )
-                sp2.y_pos = y_pos
-                sp2.x_pos = para.lines[0].bbox[0] if para.lines else 0.0
-                extra.append((y_pos, sp2))
-        # 结构段落的 y 位置:取匹配到的页面行 y
-        struct_with_y = []
-        for sp in sps:
-            y_pos = 0.0
-            x_pos = 0.0
-            sp_norm = _norm_for_match(sp.text)
-            for line in lines:
-                ln = _norm_for_match(line.text)
-                if not ln:
-                    continue
-                if ln in sp_norm or sp_norm in ln:
-                    y_pos = line.bbox[1]
-                    x_pos = max(x_pos, line.bbox[0])
-                    break
-            sp.y_pos = y_pos
-            sp.x_pos = x_pos
-            struct_with_y.append((y_pos, sp))
-        # 合并并按 y 排序
-        all_items = extra + struct_with_y
-        all_items.sort(key=lambda x: x[0])
-        for _, sp2 in all_items:
-            merged.append(sp2)
-    # 排序:按页
-    merged.sort(key=lambda p: p.page_index)
-    return merged
-
-
 def _extract_structured_paragraphs(pdf: fitz.Document) -> Optional[List[StructPara]]:
     """从 Tagged PDF 结构树提取作者真实段落。
     返回 None 表示该 PDF 无结构树(退回启发式段落重建)。
@@ -638,6 +558,11 @@ def _extract_structured_paragraphs(pdf: fitz.Document) -> Optional[List[StructPa
             if pdf[pi].xref == page_xref:
                 return pi
         return 0
+
+    # 每页行缓存(用于 y/x 定位和加粗匹配)
+    page_lines_cache: dict = {}
+    for pi in range(pdf.page_count):
+        page_lines_cache[pi] = _extract_lines(pdf[pi])
 
     def _elem_text(elem_xref: int, depth: int = 0) -> str:
         """递归提取元素文本(聚合所有后代 Span 的 ActualText)"""
@@ -694,7 +619,18 @@ def _extract_structured_paragraphs(pdf: fitz.Document) -> Optional[List[StructPa
             text = _LIST_MARKER_RE.sub("", text)  # 清理列表符残留(如 'l 胃經腹部...')
             text = text.strip()
             if text:
-                paras.append(StructPara(text=text, type=stype, page_index=page_index))
+                sp2 = StructPara(text=text, type=stype, page_index=page_index)
+                # 定位 y/x:匹配该页行文本(规范化)
+                sp_norm = _norm_for_match(text)
+                for line in page_lines_cache.get(page_index, []):
+                    ln = _norm_for_match(line.text)
+                    if not ln:
+                        continue
+                    if ln in sp_norm or sp_norm in ln:
+                        sp2.y_pos = line.bbox[1]
+                        sp2.x_pos = max(sp2.x_pos, line.bbox[0])
+                        break
+                paras.append(sp2)
             # 段落元素文本已聚合,不递归输出子元素(避免 LBody 重复)
             return
 
@@ -919,8 +855,6 @@ def convert_pdf_to_docx(
 
     # 首选:Tagged PDF 结构树(作者真实段落,无需启发式)
     struct_paras = _extract_structured_paragraphs(pdf)
-    if struct_paras:
-        struct_paras = _merge_struct_with_lines(struct_paras, pdf)
     used_struct = struct_paras is not None
 
     try:
@@ -945,8 +879,6 @@ def convert_pdf_to_docx(
                 if i > 0 and page_breaks:
                     doc.add_page_break()
                 page_lines = page_lines_cache.get(i, [])
-                # 页面正文基准字号(样式推断用)
-                body_size = _estimate_body_size(page_lines)
                 # 构造本页输出项:段落 + 图片,按 y 合并排序
                 items: List[tuple] = []  # (y, 'para'|'img', obj)
                 for sp in by_page.get(i, []):
