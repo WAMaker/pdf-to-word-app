@@ -552,6 +552,8 @@ class StructPara:
     type: str           # 'P' | 'H' | 'H1'..'H3' | 'LI' | 'Title' | ...
     page_index: int     # 0-based
     bold: bool = False  # 后续由行信息补充
+    y_pos: float = 0.0  # 段落 y 位置(用于图片插入定位)
+    x_pos: float = 0.0  # 段落 x 位置(首行缩进推断)
 
 
 def _norm_for_match(s: str) -> str:
@@ -589,11 +591,8 @@ def _merge_struct_with_lines(struct_paras: List[StructPara], pdf: fitz.Document)
     for pno in sorted(by_page.keys()):
         sps = by_page[pno]
         lines = page_lines.get(pno, [])
-        # 构建已覆盖文本集合
-        covered = set()
-        for sp in sps:
-            covered.add(_norm_for_match(sp.text))
-        # 对每行:若不在任何结构段落中,补充为独立段落
+        # 收集未覆盖行(结构树遗漏的文本,如项目符号列表项)
+        uncovered: List[TextLine] = []
         for line in lines:
             ln = _norm_for_match(line.text)
             if not ln or len(ln) < 4:
@@ -604,12 +603,45 @@ def _merge_struct_with_lines(struct_paras: List[StructPara], pdf: fitz.Document)
                     in_covered = True
                     break
             if not in_covered:
-                # 合并相邻未覆盖行为一段
-                merged.append(StructPara(
-                    text=line.text.strip(), type="P", page_index=pno,
-                ))
-        merged.extend(sps)
-    # 排序:按页,同页按出现顺序(简化:页内结构段在补充段之后)
+                uncovered.append(line)
+        # 用启发式重建未覆盖行(合并跨行片段,如'定一區：...' + '的橫向突起...')
+        extra: List[StructPara] = []
+        if uncovered:
+            page_w = pdf[pno].rect.width
+            for para in rebuild_paragraphs(uncovered, page_w, 842.0, None):
+                if para.image is not None or not para.text.strip():
+                    continue
+                # 记录补充段的 y 位置(用于排序:取段落首行 y)
+                y_pos = para.lines[0].bbox[1] if para.lines else 0.0
+                sp2 = StructPara(
+                    text=para.text.strip(), type="P", page_index=pno,
+                )
+                sp2.y_pos = y_pos
+                sp2.x_pos = para.lines[0].bbox[0] if para.lines else 0.0
+                extra.append((y_pos, sp2))
+        # 结构段落的 y 位置:取匹配到的页面行 y
+        struct_with_y = []
+        for sp in sps:
+            y_pos = 0.0
+            x_pos = 0.0
+            sp_norm = _norm_for_match(sp.text)
+            for line in lines:
+                ln = _norm_for_match(line.text)
+                if not ln:
+                    continue
+                if ln in sp_norm or sp_norm in ln:
+                    y_pos = line.bbox[1]
+                    x_pos = max(x_pos, line.bbox[0])
+                    break
+            sp.y_pos = y_pos
+            sp.x_pos = x_pos
+            struct_with_y.append((y_pos, sp))
+        # 合并并按 y 排序
+        all_items = extra + struct_with_y
+        all_items.sort(key=lambda x: x[0])
+        for _, sp2 in all_items:
+            merged.append(sp2)
+    # 排序:按页
     merged.sort(key=lambda p: p.page_index)
     return merged
 
@@ -940,6 +972,10 @@ def convert_pdf_to_docx(
             page_lines_cache = {}
             for i in range(pdf.page_count):
                 page_lines_cache[i] = _extract_lines(pdf[i])
+            # 预提取每页图片(y 定位用)
+            page_imgs_cache = {}
+            for i in range(pdf.page_count):
+                page_imgs_cache[i] = _extract_images(pdf[i])
             struct_first_done = False  # 结构树路径跨页追踪全文档首个段落
             for i, page in enumerate(pdf):
                 if progress_cb:
@@ -949,7 +985,23 @@ def convert_pdf_to_docx(
                 page_lines = page_lines_cache.get(i, [])
                 # 页面正文基准字号(样式推断用)
                 body_size = _estimate_body_size(page_lines)
+                # 构造本页输出项:段落 + 图片,按 y 合并排序
+                items: List[tuple] = []  # (y, 'para'|'img', obj)
                 for sp in by_page.get(i, []):
+                    items.append((sp.y_pos, "para", sp))
+                for img in page_imgs_cache.get(i, []):
+                    items.append((img.bbox[1], "img", img))
+                items.sort(key=lambda x: (x[0], 0 if x[1] == "para" else 1))
+                for _, kind, obj in items:
+                    if kind == "img":
+                        # 图片:提取并插入当前位置
+                        img_path = _add_image_to_doc(
+                            doc, pdf, obj, image_dir or "", page.rect.width)
+                        if img_path:
+                            image_count += 1
+                            preview_blocks.append({"type": "image", "path": img_path})
+                        continue
+                    sp = obj  # StructPara
                     sp_text = sp.text.strip()
                     # 样式推断:优先结构类型,退回启发式(字号/加粗/长度)
                     if sp.type in ("H", "H1", "Title"):
@@ -1031,13 +1083,6 @@ def convert_pdf_to_docx(
                         "align": "left",
                         "spans": span_data,
                     })
-            # 图片:结构树不含图片,退回按页提取插图
-            for i, page in enumerate(pdf):
-                for img in _extract_images(page):
-                    img_path = _add_image_to_doc(doc, pdf, img, image_dir or "", page.rect.width)
-                    if img_path:
-                        image_count += 1
-                        preview_blocks.append({"type": "image", "path": img_path})
         else:
             pending_para: Optional[Paragraph] = None  # 跨页待续接的未完成段落(暂未写入 docx)
             for i, page in enumerate(pdf):
