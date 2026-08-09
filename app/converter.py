@@ -39,6 +39,7 @@ class TextLine:
     bold: bool
     align: Optional[str]  # 'left' | 'center' | 'right' | 'justify' | None
     block_id: int = 0     # 所属 PDF 文本块 ID(辅助段落判断)
+    list_marker: bool = False  # 是否以列表符开头(如 'l '、'1.'、'•')→ 通常是列表项/小标题
 
 
 @dataclass
@@ -93,6 +94,9 @@ def _is_cjk_text(text: str) -> bool:
     return cjk / max(len(text), 1) > 0.3
 
 
+_LIST_MARKER_RE = re.compile(r"^(?:[l1iI•·▪●]|[0-9]{1,2}[.、.)])\s+")
+
+
 def _clean_text(s: str) -> str:
     """清理文本:去空白、修正常见 OCR/排版残留、剔除非法 XML 控制字符"""
     # 剔除 XML 1.0 不允许的控制字符(NULL、0x01-0x08、0x0B、0x0C、0x0E-0x1F 等)
@@ -104,11 +108,21 @@ def _clean_text(s: str) -> str:
     s = s.replace("\u3000", " ").replace("\xa0", " ")
     s = re.sub(r"[ \t]+", " ", s)
     s = s.strip()
+    # 清理行首列表符残留(PDF 中项目符号常被渲染为 'l'/'1'/'•')
+    s = _LIST_MARKER_RE.sub("", s)
+    # 单独一个列表符字符(无后续文字)直接清空
+    if re.fullmatch(r"[l1iI•·▪●]", s):
+        return ""
     return s
 
 
+def _is_list_marker_line(raw: str) -> bool:
+    """判断原始文本行是否以列表符开头(用于段落边界识别)"""
+    return bool(_LIST_MARKER_RE.match(raw.strip()))
+
+
 def _is_blank_line(s: str) -> bool:
-    return not s.strip() or len(s.strip()) <= 1
+    return not s.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +191,8 @@ def _extract_lines(page: fitz.Page) -> List[TextLine]:
             spans = line.get("spans", [])
             if not spans:
                 continue
-            text = _clean_text("".join(s.get("text", "") for s in spans))
+            raw = "".join(s.get("text", "") for s in spans)
+            text = _clean_text(raw)
             if not text:
                 continue
             bbox = line.get("bbox", (0, 0, 0, 0))
@@ -194,6 +209,7 @@ def _extract_lines(page: fitz.Page) -> List[TextLine]:
                 bold=bold,
                 align=_detect_align(line, page.rect.width),
                 block_id=block.get("number", 0),
+                list_marker=_is_list_marker_line(raw),
             ))
     return lines
 
@@ -203,14 +219,19 @@ def _detect_align(line, page_width: float) -> str:
     line_width = x1 - x0
     left_margin = x0
     right_margin = page_width - x1
-    if left_margin < 5 and right_margin < 5:
-        return "justify" if line_width > page_width * 0.8 else "left"
-    if left_margin > right_margin * 2.5 and left_margin > 20:
-        return "right"
-    if right_margin > left_margin * 2.5 and right_margin > 20:
-        return "left"  # 有左缩进,不算居中
-    if left_margin > 10 and right_margin > 10:
+    width_ratio = line_width / page_width
+    # 满宽行(占页宽 55% 以上):两端对齐或左对齐正文,不是居中
+    # (首行缩进段落的段首行也常达到 ~60% 宽,不能判居中)
+    if width_ratio > 0.55:
+        if left_margin < 8 and right_margin < 8:
+            return "justify"
+        return "left"
+    # 短行(≤55%):居中需同时满足:左右边距都较明显(>30pt)且接近
+    if left_margin > 30 and right_margin > 30 \
+            and abs(left_margin - right_margin) <= max(12, min(left_margin, right_margin) * 0.35):
         return "center"
+    if left_margin > right_margin * 2.2 and left_margin > 20:
+        return "right"
     return "left"
 
 
@@ -220,11 +241,20 @@ def _infer_style(line: TextLine, is_first: bool, para_lines: List[TextLine],
     策略:基于相对字号(与正文字号比较)+ 加粗 + 文本长度 + 段落结构
     不依赖绝对字号阈值,适应不同文档的字体大小习惯。
     :param body_size: 页面正文字号估计(0 表示未知,退回绝对阈值)
+    :param is_first: 是否全文档第一个非空文本段落(课程/文档大标题通常在此)
     """
     para_text = "".join(l.text for l in para_lines)
     para_len = len(para_text.strip())
     # 以句末标点结尾的通常是正文残片,不是标题
     ends_with_punct = para_text.rstrip().endswith(("。", ".", "！", "？", "!", "?", "，", ","))
+
+    # 全文档首段 + 加粗 + 单行 + 短文本 → 大标题(如课程标题)
+    if is_first and line.bold and len(para_lines) == 1 and para_len <= 40:
+        return "title"
+
+    # 列表符开头且加粗且短 → 列表项小标题(如 'l 胃經腹部重點穴位診斷作用及功能複習')
+    if line.list_marker and line.bold and para_len <= 30 and not ends_with_punct:
+        return "heading"
 
     # 绝对阈值兜底:超大字号必为标题
     if line.size >= 20:
@@ -237,8 +267,8 @@ def _infer_style(line: TextLine, is_first: bool, para_lines: List[TextLine],
         # 略大(≥1.05x)且加粗且段落很短(≤20字)→ 小标题
         if ratio >= 1.05 and line.bold and para_len <= 20 and not ends_with_punct:
             return "heading"
-        # 同字号加粗且段落极短(≤12字)且单行且不以标点结尾 → 小标题
-        if abs(ratio - 1.0) < 0.05 and line.bold and para_len <= 12 \
+        # 同字号加粗且段落短(≤18字)且单行且不以标点结尾 → 小标题
+        if abs(ratio - 1.0) < 0.05 and line.bold and para_len <= 18 \
                 and len(para_lines) == 1 and not ends_with_punct:
             return "heading"
         return "body"
@@ -273,35 +303,45 @@ def _estimate_body_size(lines: List[TextLine]) -> float:
 def _same_paragraph(prev: TextLine, cur: TextLine, para_gap: float, line_gap: float) -> bool:
     """判断两行是否属于同一逻辑段落(核心算法)
     :param para_gap: 段落间距阈值(动态计算,pt)
-    :param line_gap: 行内间距中位数(pt)
+    :param line_gap: 行内间距基准(pt,取中位数)
+    段落边界识别策略(按优先级):
+    1. 行距显著大于行内基准 → 新段(真实的段间距)
+    2. 当前行比上一行明显右移(>12pt)→ 新段(首行缩进,最常见的段界标志)
+    3. 其余情况合并为同一段。
+    注意:不依赖 PDF 文本块 ID(同一段经常被拆成多个 block),
+    也不在浮点边缘比较行距(有的行距 16.7、有的 16.8,阈值取中位数会误判)。
     """
     # 垂直距离:当前行顶部 - 上一行底部
     gap = cur.bbox[1] - prev.bbox[3]
 
-    # 若行距大于段落阈值 → 新段落
+    # 1) 行距明显大于行内基准(>1.6x)→ 新段落
     if gap > para_gap:
         return False
 
-    # 若当前行有显著左缩进(>12pt),通常是新段落(如正文首行缩进)
+    # 2) 当前行有显著左缩进(>12pt),通常是新段落(如正文首行缩进)
     if cur.bbox[0] - prev.bbox[0] > 12:
         return False
 
-    # 不同文本块且行距明显大于典型行距 → 新段
-    if prev.block_id != cur.block_id and gap > line_gap:
+    # 2b) 当前行或上一行以列表符开头(如 'l 胃經腹部...'、'1. xxx')→ 列表项/小标题,必为新段
+    if cur.list_marker or prev.list_marker:
         return False
 
+    # 3) 默认:同一段落
     return True
 
 
 def _estimate_para_gap(lines: List[TextLine]) -> Tuple[float, float]:
     """动态估算间距阈值
     :return: (段落阈值, 行内间距基准)
-    行内间距取低分位值(20%),段落阈值 = 行内间距 * 2.0(至少 10pt),
-    避免被标题/图片间的大间距拉高阈值。
+    行内间距取低分位值(20%),段落阈值 = 行内间距 * 2.0(至少 10pt)。
+    先按 y 坐标排序再统计,避免 PDF 文本块顺序(非视觉顺序)污染行距统计;
+    低分位避免被标题/图片间的大间距拉高阈值。
+    注意:很多 PDF 段间距 == 行间距(如本工具样本文档),此时段界靠首行缩进判断。
     """
+    sorted_lines = sorted(lines, key=lambda l: l.bbox[1])
     gaps = []
-    for i in range(1, len(lines)):
-        g = lines[i].bbox[1] - lines[i - 1].bbox[3]
+    for i in range(1, len(sorted_lines)):
+        g = sorted_lines[i].bbox[1] - sorted_lines[i - 1].bbox[3]
         if g > 0:
             gaps.append(g)
     if not gaps:
@@ -323,8 +363,12 @@ def _align_from_lines(para: Paragraph, page_width: float) -> str:
 
 
 def rebuild_paragraphs(lines: List[TextLine], page_width: float, page_height: float,
-                       images: Optional[List[ImageBlock]] = None) -> List[Paragraph]:
-    """把提取的行重建为逻辑段落(支持图片穿插)"""
+                       images: Optional[List[ImageBlock]] = None,
+                       first_text: bool = True) -> List[Paragraph]:
+    """把提取的行重建为逻辑段落(支持图片穿插)
+    :param first_text: 本次调用中第一个文本段落是否属于全文档第一个文本段落
+                       (用于标题识别;多页文档时跨页传递)
+    """
     paragraphs: List[Paragraph] = []
     current: Optional[Paragraph] = None
 
@@ -368,11 +412,13 @@ def rebuild_paragraphs(lines: List[TextLine], page_width: float, page_height: fl
 
     # 后处理:样式推断 + 对齐修正(跳过图片段落)
     body_size = _estimate_body_size(lines)
+    is_first_local = first_text
     for para in paragraphs:
         if para.image is not None:
             continue
         para.align = _align_from_lines(para, page_width)
-        para.style = _infer_style(para.lines[0], True, para.lines, body_size)
+        para.style = _infer_style(para.lines[0], is_first_local, para.lines, body_size)
+        is_first_local = False  # 仅全文档第一个文本段落享受 title 候选
         # 首行缩进检测:第二行比第一行靠左,且第一行有缩进 → 段落缩进
         if len(para.lines) > 1:
             first_x0 = para.lines[0].bbox[0]
@@ -532,13 +578,20 @@ def convert_pdf_to_docx(
     para_count = 0
     image_count = 0
     preview_blocks: List[dict] = []  # 预览结构化数据
+    first_text_done = False  # 跨页追踪全文档第一个文本段落(标题识别用)
 
     try:
         for i, page in enumerate(pdf):
             if progress_cb:
                 progress_cb(i + 1, total)
+            # 多页文档:每页之间插入分页符,保留 PDF 的页结构
+            if i > 0:
+                doc.add_page_break()
             lines, images = _extract_elements(page)
-            paragraphs = rebuild_paragraphs(lines, page.rect.width, page.rect.height, images)
+            paragraphs = rebuild_paragraphs(
+                lines, page.rect.width, page.rect.height, images,
+                first_text=not first_text_done,
+            )
             for para in paragraphs:
                 img_path = add_paragraph(
                     doc, para, font_name, base_size,
@@ -553,6 +606,8 @@ def convert_pdf_to_docx(
                     })
                 else:
                     para_count += 1
+                    if not first_text_done:
+                        first_text_done = True
                     preview_blocks.append({
                         "type": "text",
                         "text": para.text,

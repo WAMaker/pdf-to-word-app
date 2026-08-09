@@ -123,6 +123,52 @@ def test_images():
     print(f"\n✅ 图片测试通过: 提取 {result['images']} 张,docx 内嵌 {len(docx.inline_shapes)} 张")
 
 
+def test_realistic_docx():
+    """回归测试:使用真实排版风格的经络课件 PDF(多页、跨页段落、列表标题、插图)
+    覆盖修复的历史 bug:
+    - 全文被误判为居中对齐(左右边距均>10pt 的行不应都判 center)
+    - 段落碎片化(每行一个 block 时 block_id 判断导致同段被拆开)
+    - 多页文档无分页符
+    - 每页第一个加粗段落被误判为 title(应只有全文档第一个)
+    - 列表符标题('l xxx')与正文合并
+    """
+    import tempfile
+    pdf_path = os.path.join(os.path.dirname(TEST_DIR), "samples", "抱朴-經絡輔導課20.pdf")
+    if not os.path.isfile(pdf_path):
+        print("\n⚠️ 经络课件样例不存在,跳过真实排版回归测试")
+        return
+    docx_path = os.path.join(TEST_DIR, "sample_realistic.docx")
+    img_dir = tempfile.mkdtemp()
+    result = convert_pdf_to_docx(pdf_path, docx_path, font_size_label="三号", image_dir=img_dir)
+
+    # 1) 标题:只有全文档第一个加粗单行短段落是 title
+    titles = [b for b in result["preview"] if b["type"] == "text" and b["style"] == "title"]
+    assert len(titles) == 1, f"应只有 1 个 title,实际 {len(titles)} 个: {[t['text'][:20] for t in titles]}"
+    assert titles[0]["text"].startswith("經絡輔導課"), f"title 内容不对: {titles[0]['text']}"
+
+    # 2) 正文对齐:非居中文本不应被误判为 center
+    body = [b for b in result["preview"] if b["type"] == "text" and b["style"] == "body"]
+    center_bodies = [b for b in body if b["align"] == "center"]
+    assert not center_bodies, f"正文被误判为居中: {[b['text'][:20] for b in center_bodies]}"
+
+    # 3) 段落重建:应合并为完整逻辑段落(不是每行一段)
+    assert result["paragraphs"] < 150, f"段落仍碎片化: {result['paragraphs']} 段(21页应~100段)"
+    long_bodies = [b for b in body if len(b["text"]) > 80]
+    assert long_bodies, "正文段落未合并,仍然碎片化"
+
+    # 4) 多页文档应有分页符(21 页 → 20 个)
+    import zipfile
+    with zipfile.ZipFile(docx_path) as z:
+        xml = z.read("word/document.xml").decode("utf-8")
+    assert xml.count('w:br w:type="page"') == 20, "多页文档缺少分页符"
+
+    # 5) 插图保留
+    assert result["images"] == 1, f"应保留 1 张插图,实际 {result['images']}"
+
+    print(f"\n✅ 真实排版回归测试通过: {result['paragraphs']} 段, {result['images']} 图")
+
+
 if __name__ == "__main__":
     main()
     test_images()
+    test_realistic_docx()
