@@ -347,6 +347,10 @@ def _same_paragraph(prev: TextLine, cur: TextLine, para_gap: float, line_gap: fl
 
     # 2b) 当前行或上一行以列表符开头(如 'l 胃經腹部...'、'1. xxx')→ 列表项/小标题,必为新段
     if cur.list_marker or prev.list_marker:
+        # 例外:列表项引导语跨行(如 '• 定一區：...耳甲' 后接 '的橫向突起...')
+        # 条件:上一行是列表项 且 行尾非句末标点 且 行较长(>25字,是内容被截断而非短标题)
+        if prev.list_marker and not _is_para_complete_line(prev) and len(prev.text) > 25:
+            return True
         return False
 
     # 3) 默认:同一段落
@@ -610,6 +614,32 @@ def add_paragraph(doc: Document, para: Paragraph, font_name: str, base_size: flo
     return None
 
 
+_SENT_END_RE = re.compile(r"[。！？!?；;：:\”’」』）)]$")
+
+def _is_para_complete_line(line: TextLine) -> bool:
+    """判断单行是否以句末标点结束(完整行)"""
+    text = line.text.rstrip()
+    if not text:
+        return True
+    return bool(_SENT_END_RE.search(text))
+
+
+def _is_para_complete(para: Paragraph) -> bool:
+    """判断段落是否以句末标点结束(完整段落)。
+    以句号/感叹号/问号/冒号/引号等结尾 → 完整;
+    标题/小标题样式(如 '胃經腹部重點穴位診斷作用及功能複習')虽无标点,
+    但作为独立标题也是完整的,不参与跨页续接。
+    """
+    if para.image is not None:
+        return True
+    if para.style in ("title", "heading"):
+        return True
+    text = para.text.rstrip()
+    if not text:
+        return True
+    return bool(_SENT_END_RE.search(text))
+
+
 def convert_pdf_to_docx(
     pdf_path: str,
     docx_path: str,
@@ -649,6 +679,7 @@ def convert_pdf_to_docx(
     first_text_done = False  # 跨页追踪全文档第一个文本段落(标题识别用)
 
     try:
+        pending_para: Optional[Paragraph] = None  # 跨页待续接的未完成段落(暂未写入 docx)
         for i, page in enumerate(pdf):
             if progress_cb:
                 progress_cb(i + 1, total)
@@ -660,7 +691,36 @@ def convert_pdf_to_docx(
                 lines, page.rect.width, page.rect.height, images,
                 first_text=not first_text_done,
             )
+
+            # 跨页段落合并:把上一页未完成段接到本页开头文本段之前
+            if pending_para is not None:
+                first_text_para = next(
+                    (p for p in paragraphs if p.image is None and p.text.strip()),
+                    None,
+                )
+                if first_text_para is not None:
+                    # 上一页未完成段的行 + 本页首段行 = 完整段落
+                    merged_lines = pending_para.lines + first_text_para.lines
+                    pending_para.lines = merged_lines
+                    pending_para.bold = _infer_para_bold(merged_lines)
+                    paragraphs.remove(first_text_para)
+                    paragraphs.insert(0, pending_para)
+                else:
+                    # 本页无文本(纯图片页):pending 无法续接,直接写入
+                    paragraphs.insert(0, pending_para)
+                pending_para = None
+
+            # 确定本页最后一个未完成段落(若存在则不写入,留作跨页续接)
+            last_incomplete = None
+            for para in reversed(paragraphs):
+                if para.image is None and para.text.strip() and not _is_para_complete(para):
+                    last_incomplete = para
+                    break
+
+            # 写入本页所有段落(除 last_incomplete 外)
             for para in paragraphs:
+                if para is last_incomplete:
+                    continue  # 暂不写入,待下页续接
                 img_path = add_paragraph(
                     doc, para, font_name, base_size,
                     pdf=pdf, image_dir=image_dir, page_width=page.rect.width,
@@ -685,8 +745,34 @@ def convert_pdf_to_docx(
                         "spans": [(t, b) for line in para.lines for t, b in line.spans]
                         if para.style == "body" else [],
                     })
+
+            # 下页待续接
+            pending_para = last_incomplete
     finally:
         pdf.close()
+
+    # 处理末尾残留的未完成段落(文档结尾无下一页)
+    if pending_para is not None:
+        img_path = add_paragraph(
+            doc, pending_para, font_name, base_size, pdf=None,
+            image_dir=image_dir, page_width=595.0,
+        )
+        if pending_para.image is not None:
+            if img_path:
+                image_count += 1
+            preview_blocks.append({"type": "image", "path": img_path})
+        else:
+            para_count += 1
+            if not first_text_done:
+                first_text_done = True
+            preview_blocks.append({
+                "type": "text",
+                "text": pending_para.text,
+                "style": pending_para.style,
+                "align": pending_para.align,
+                "spans": [(t, b) for line in pending_para.lines for t, b in line.spans]
+                if pending_para.style == "body" else [],
+            })
 
     doc.save(docx_path)
 

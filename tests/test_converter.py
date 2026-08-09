@@ -214,10 +214,42 @@ def test_realistic_docx():
     all_text = "\n".join(p.text for p in d.paragraphs if p.text.strip())
     assert "功能：第一，它能治療" in all_text, "列举引导语段落未正确合并(气冲功能段)"
     assert "主治：第一，它能夠治療急" in all_text, "列举引导语段落未正确合并(梁丘主治段)"
+
+    # 10) 跨页段落合并:PDF 分页截断的句子应续接为完整段
+    assert "再來看胃經，就能夠得出" in all_text.replace("\n", ""), "跨页段落未合并(经络PDF第1-2页)"
+
+    # 11) 标题完整性:无标点的短标题不应被跨页逻辑吞并
+    assert "胃經腹部重點穴位診斷作用及功能複習\n" in all_text + "\n", \
+        "短标题被跨页合并逻辑吞并"
     print(f"\n✅ 真实排版回归测试通过: {result['paragraphs']} 段, {result['images']} 图, 加粗 {len(bold_paras)} 段")
+
+
+def test_ear_docx():
+    """第二份样例:耳诊课件 PDF(18页、6图、列表引导语'定一區：'等)
+    覆盖:跨页合并、列表引导语跨行合并、图片提取。
+    """
+    import tempfile
+    pdf_path = os.path.join(os.path.dirname(TEST_DIR), "samples", "抱樸-耳診輔導課2.pdf")
+    if not os.path.isfile(pdf_path):
+        print("\n⚠️ 耳诊样例不存在,跳过")
+        return
+    docx_path = os.path.join(TEST_DIR, "sample_ear.docx")
+    img_dir = tempfile.mkdtemp()
+    result = convert_pdf_to_docx(pdf_path, docx_path, font_size_label="三号", image_dir=img_dir)
+    assert result["pages"] == 18, f"页数不对: {result['pages']}"
+    assert result["images"] == 6, f"图片数不对: {result['images']}"
+    d = Document(docx_path)
+    all_text = "\n".join(p.text for p in d.paragraphs if p.text.strip())
+    # 列表引导语'定二到四區：...'应与续行合并
+    assert "再找到四區邊界" in all_text.replace("\n", ""), "列表引导语跨行未合并"
+    # 完整独立列表项保持独立
+    assert "定六區：對耳輪上腳所連接的區域是耳輪六區。" in all_text, "完整列表项被误合并"
+    os.remove(docx_path)
+    print(f"\n✅ 耳诊样例测试通过: {result['paragraphs']} 段, {result['images']} 图")
 
 
 if __name__ == "__main__":
     main()
     test_images()
     test_realistic_docx()
+    test_ear_docx()
