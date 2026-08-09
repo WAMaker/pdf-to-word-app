@@ -63,24 +63,6 @@ _STYLE_TAG = {
 }
 
 
-def _split_lines(text: str, n: int) -> list[str]:
-    """按行数均分文本(预览行级加粗用)
-    para.text 是各行 text 的直接拼接,行边界无法从拼接结果还原,
-    这里按字符数均分近似;预览仅用于视觉参考,不追求精确。
-    """
-    if n <= 1 or not text:
-        return [text]
-    total = len(text)
-    sizes = [total // n] * n
-    for i in range(total % n):
-        sizes[i] += 1
-    parts, pos = [], 0
-    for s in sizes:
-        parts.append(text[pos:pos + s])
-        pos += s
-    return parts
-
-
 class ConvertThread(QThread):
     """后台转换线程,避免界面卡死"""
     progress = Signal(int, int)
@@ -444,7 +426,7 @@ class MainWindow(QMainWindow):
             style = block.get("style", "body")
             align = block.get("align", "left")
             para_bold = block.get("bold", False)
-            line_bolds = block.get("line_bolds", [])
+            spans = block.get("spans", [])
 
             if style == "title":
                 px = size_px + 14
@@ -454,23 +436,22 @@ class MainWindow(QMainWindow):
                 weight = "bold"
             else:
                 px = size_px
-                # 行级加粗:按行保留 PDF 原文加粗(强调/章节说明)
-                weight = "bold" if para_bold else "normal"
+                weight = "normal"
 
             halign = {"center": "center", "right": "right", "justify": "justify"}.get(align, "left")
             esc = html.escape(text)
-            # 行级加粗时,按行拆分渲染(用 <br> 连接,加粗行显示为粗体)
-            if line_bolds:
-                line_parts = []
-                for seg, b in zip(_split_lines(text, len(line_bolds)), line_bolds):
-                    w = "bold" if b else "normal"
-                    line_parts.append(
-                        f'<span style="font-weight:{w}">{html.escape(seg)}</span>'
+            # span 级加粗:按 (文本, 加粗) 分段渲染,行内部分加粗精确显示
+            if spans:
+                span_html = []
+                for st, sb in spans:
+                    w = "bold" if sb else "normal"
+                    span_html.append(
+                        f'<span style="font-weight:{w}">{html.escape(st)}</span>'
                     )
                 parts.append(
                     f'<div style="font-size:{px}px;font-family:{font_name};'
                     f'color:#2c3e50;text-align:{halign};padding:2px 0;">'
-                    + "".join(line_parts) + "</div>"
+                    + "".join(span_html) + "</div>"
                 )
             else:
                 parts.append(

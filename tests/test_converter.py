@@ -195,6 +195,21 @@ def test_realistic_docx():
                    and any(not r.font.bold for r in p.runs if r.text.strip())]
     assert mixed_paras, "未找到行级混合加粗段落(原文部分行加粗的段落应保留为行级)"
 
+    # 8b) span 级加粗:同一行内部分字加粗(如穴位名),应精确到 run 而非整行
+    # 例:'胃經到了腹部的第一個穴位叫[不容]。' → '不容' 加粗,其余不加粗
+    span_mixed = 0
+    for p in d.paragraphs:
+        if not p.text.strip():
+            continue
+        bolds = [r.font.bold for r in p.runs if r.text.strip()]
+        if bolds and any(bolds) and any(not b for b in bolds):
+            span_mixed += 1
+    assert span_mixed >= 10, f"span 级混合加粗段落过少: {span_mixed}(期望≥10,PDF大量穴位名加粗)"
+    # 具体验证:穴位名 '不容' 应独立加粗 run
+    rong_bu = [r for p in d.paragraphs for r in p.runs
+               if r.text.strip() == "不容" and r.font.bold]
+    assert rong_bu, "穴位名'不容'应加粗且为独立 run(span级加粗未生效)"
+
     # 9) 列举引导语合并:冒号结尾后跟'第一，'应合并为同一段(不是换行断裂)
     all_text = "\n".join(p.text for p in d.paragraphs if p.text.strip())
     assert "功能：第一，它能治療" in all_text, "列举引导语段落未正确合并(气冲功能段)"

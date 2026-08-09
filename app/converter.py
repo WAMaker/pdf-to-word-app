@@ -40,6 +40,12 @@ class TextLine:
     align: Optional[str]  # 'left' | 'center' | 'right' | 'justify' | None
     block_id: int = 0     # 所属 PDF 文本块 ID(辅助段落判断)
     list_marker: bool = False  # 是否以列表符开头(如 'l '、'1.'、'•')→ 通常是列表项/小标题
+    spans: List[Tuple[str, bool]] = field(default_factory=list)  # (文本, 加粗) 行内分段样式
+
+    def __post_init__(self):
+        # 若无 span 级信息,回退为整行一条
+        if not self.spans and self.text:
+            self.spans = [(self.text, self.bold)]
 
 
 @dataclass
@@ -202,6 +208,15 @@ def _extract_lines(page: fitz.Page) -> List[TextLine]:
             flags = [s.get("flags", 0) for s in spans]
             # flags bit 4 (16) = bold
             bold = any(f & 16 for f in flags)
+            # 行内分段样式:逐 span 收集 (文本, 加粗),供行内部分加粗保留
+            span_styles: List[Tuple[str, bool]] = []
+            for s in spans:
+                st = _clean_text(s.get("text", ""))
+                if not st:
+                    continue
+                span_styles.append((st, bool(s.get("flags", 0) & 16)))
+            if not span_styles:
+                span_styles = [(text, bold)]
             lines.append(TextLine(
                 text=text,
                 bbox=bbox,
@@ -211,6 +226,7 @@ def _extract_lines(page: fitz.Page) -> List[TextLine]:
                 align=_detect_align(line, page.rect.width),
                 block_id=block.get("number", 0),
                 list_marker=_is_list_marker_line(raw),
+                spans=span_styles,
             ))
     return lines
 
@@ -579,12 +595,13 @@ def add_paragraph(doc: Document, para: Paragraph, font_name: str, base_size: flo
     else:
         size = base_size
 
-    # 写入文本:行级加粗(每行独立 run),保留 PDF 原文逐行的加粗/常规样式
-    # 而不是整段统一加粗——避免'原文只加粗一行,转换后整段变粗'的错判
+    # 写入文本:span 级加粗(行内部分加粗),保留 PDF 原文逐 span 的加粗/常规样式
+    # 而不是整行/整段统一加粗——避免'原文只加粗穴位名,转换后整行变粗'的错判
     if para.style == "body":
         for line in para.lines:
-            run = p.add_run(line.text)
-            _set_run_font(run, font_name, size, line.bold)
+            for span_text, span_bold in line.spans:
+                run = p.add_run(span_text)
+                _set_run_font(run, font_name, size, span_bold)
     else:
         text = para.text
         run = p.add_run(text)
@@ -664,8 +681,9 @@ def convert_pdf_to_docx(
                         "text": para.text,
                         "style": para.style,
                         "align": para.align,
-                        # 行级加粗:各行的 bold 状态(预览用)
-                        "line_bolds": [l.bold for l in para.lines] if para.style == "body" else [],
+                        # span 级加粗:每行各 span 的 (文本, 加粗) 列表(预览用)
+                        "spans": [(t, b) for line in para.lines for t, b in line.spans]
+                        if para.style == "body" else [],
                     })
     finally:
         pdf.close()
