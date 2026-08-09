@@ -156,18 +156,28 @@ def test_realistic_docx():
     long_bodies = [b for b in body if len(b["text"]) > 80]
     assert long_bodies, "正文段落未合并,仍然碎片化"
 
-    # 4) 多页文档应有分页符(21 页 → 20 个)
+    # 4) 页面应为 A4,且默认流式分页(无强制分页符,避免 Word 半空页)
     import zipfile
+    d = Document(docx_path)
     with zipfile.ZipFile(docx_path) as z:
         xml = z.read("word/document.xml").decode("utf-8")
-    assert xml.count('w:br w:type="page"') == 20, "多页文档缺少分页符"
+    assert xml.count('w:br w:type="page"') == 0, "默认不应有强制分页符(流式分页)"
+    sec = d.sections[0]
+    assert abs(sec.page_width.mm - 210) < 1 and abs(sec.page_height.mm - 297) < 1, \
+        f"页面应为 A4,实际 {sec.page_width.mm:.1f}x{sec.page_height.mm:.1f}mm"
+
+    # 4b) 开启 page_breaks 时应有分页符(21 页 → 20 个)
+    docx_pb = docx_path.replace(".docx", "_pb.docx")
+    convert_pdf_to_docx(pdf_path, docx_pb, font_size_label="三号", image_dir=img_dir, page_breaks=True)
+    with zipfile.ZipFile(docx_pb) as z:
+        xml_pb = z.read("word/document.xml").decode("utf-8")
+    assert xml_pb.count('w:br w:type="page"') == 20, "page_breaks=True 时应有 20 个分页符"
+    os.remove(docx_pb)
 
     # 5) 插图保留
     assert result["images"] == 1, f"应保留 1 张插图,实际 {result['images']}"
 
     # 6) 缩进:左缩进应为相对页面边距的额外缩进(PDF 左边距不应写入 left_indent)
-    from docx import Document as _Document
-    d = _Document(docx_path)
     body_paras = [p for p in d.paragraphs if p.text.strip() and p.paragraph_format.first_line_indent]
     assert body_paras, "未检测到首行缩进段落"
     for p in body_paras[:5]:

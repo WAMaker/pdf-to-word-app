@@ -22,7 +22,7 @@ import fitz  # PyMuPDF
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml.ns import qn
-from docx.shared import Pt, RGBColor
+from docx.shared import Mm, Pt, RGBColor
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +452,20 @@ FONT_SIZE_MAP = {
 }
 
 
+def _setup_page(doc: Document):
+    """设置 A4 页面(中文文档标准),边距适中
+    Word 默认是 Letter(215.9x279.4mm),与中文 PDF 的 A4 容量不同;
+    不匹配会导致固定分页符下"一页没占满就换页"或内容溢出。
+    """
+    section = doc.sections[0]
+    section.page_width = Mm(210)
+    section.page_height = Mm(297)
+    section.left_margin = Mm(25.4)   # 1 英寸
+    section.right_margin = Mm(25.4)
+    section.top_margin = Mm(25.4)
+    section.bottom_margin = Mm(25.4)
+
+
 def _setup_style(doc: Document, font_name: str, font_size_pt: int):
     """设置文档默认样式,统一控制字体字号"""
     style = doc.styles["Normal"]
@@ -562,6 +576,7 @@ def convert_pdf_to_docx(
     font_name: str = "微软雅黑",
     progress_cb=None,
     image_dir: Optional[str] = None,
+    page_breaks: bool = False,
 ) -> dict:
     """
     转换主入口
@@ -571,6 +586,10 @@ def convert_pdf_to_docx(
     :param font_name: 中文字体名
     :param progress_cb: 进度回调(page_index, total_pages)
     :param image_dir: 图片缓存目录(用于预览;为 None 时不保留预览图片)
+    :param page_breaks: 是否按 PDF 原页插入分页符。
+        默认 False:Word 流式自动分页,改字号后全文重排,不会出现
+        "一页没占满就换页"或内容溢出的半空页。
+        设为 True 时保留 PDF 每页的分页结构(但改字号后可能留白/溢出)。
     :return: 转换结果,含 preview 结构化数据(段落+图片)
     """
     if not os.path.isfile(pdf_path):
@@ -578,6 +597,7 @@ def convert_pdf_to_docx(
 
     base_size = FONT_SIZE_MAP.get(font_size_label, 16)
     doc = Document()
+    _setup_page(doc)
     _setup_style(doc, font_name, base_size)
 
     pdf = fitz.open(pdf_path)
@@ -591,8 +611,8 @@ def convert_pdf_to_docx(
         for i, page in enumerate(pdf):
             if progress_cb:
                 progress_cb(i + 1, total)
-            # 多页文档:每页之间插入分页符,保留 PDF 的页结构
-            if i > 0:
+            # 可选:按 PDF 原页插入分页符(默认关闭,避免 Word 半空页)
+            if i > 0 and page_breaks:
                 doc.add_page_break()
             lines, images = _extract_elements(page)
             paragraphs = rebuild_paragraphs(
