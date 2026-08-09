@@ -40,6 +40,7 @@ class TextLine:
     align: Optional[str]  # 'left' | 'center' | 'right' | 'justify' | None
     block_id: int = 0     # 所属 PDF 文本块 ID(辅助段落判断)
     list_marker: bool = False  # 是否以列表符开头(如 'l '、'1.'、'•')→ 通常是列表项/小标题
+    option_marker: bool = False  # 是否以选项字母开头(如 'A.' 'B.')→ 选择题选项,独立成段
     spans: List[Tuple[str, bool]] = field(default_factory=list)  # (文本, 加粗) 行内分段样式
 
     def __post_init__(self):
@@ -102,6 +103,15 @@ def _is_cjk_text(text: str) -> bool:
 
 
 _LIST_MARKER_RE = re.compile(r"^(?:[l1iI•·▪●]|[0-9]{1,2}[.、.)])\s+")
+_OPTION_MARKER_RE = re.compile(r"^[A-D][.、．]\s*")
+_ENUM_ITEM_RE = re.compile(r"^第[一二三四五六七八九十百]+[，,、：]")
+_ANSWER_MARKER_RE = re.compile(r"^[\[【]?答案[\]】]?[:：]?\s*[A-D]?")
+
+
+
+def _is_option_marker_line(raw: str) -> bool:
+    """判断是否选择题选项行(如 'A. 即耳輪3 區...')"""
+    return bool(_OPTION_MARKER_RE.match(raw.strip()))
 
 
 def _clean_text(s: str) -> str:
@@ -226,6 +236,7 @@ def _extract_lines(page: fitz.Page) -> List[TextLine]:
                 align=_detect_align(line, page.rect.width),
                 block_id=block.get("number", 0),
                 list_marker=_is_list_marker_line(raw),
+                option_marker=_is_option_marker_line(raw),
                 spans=span_styles,
             ))
     return lines
@@ -337,13 +348,19 @@ def _same_paragraph(prev: TextLine, cur: TextLine, para_gap: float, line_gap: fl
     if gap > para_gap:
         return False
 
+    # 2a) 引导语续行:上一行是不加粗引导语(冒号/破折号结尾),
+    # 且当前行是长行(≥60%上一行宽,段内列举如 '功能：第一，它能治療...')
+    # → 合并(即使右移);当前行是短行(独立列表项如 '第一，耳舟，對應上肢；')→ 断段
+    prev_tail = prev.text.rstrip()
+    if not prev.bold and prev_tail.endswith(("：", ":", "——", "—", "“")):
+        prev_w = prev.bbox[2] - prev.bbox[0]
+        cur_w = cur.bbox[2] - cur.bbox[0]
+        if prev_w > 0 and cur_w >= prev_w * 0.6:
+            return True
+        return False
+
     # 2) 当前行有显著左缩进(>12pt),通常是新段落(如正文首行缩进)
     if cur.bbox[0] - prev.bbox[0] > 12:
-        # 例外:上一行是不加粗的引导语(冒号/破折号结尾)→ 列举引导语,续行合并
-        # (如 '...功能：' + '第一，...';加粗的标题/题目如 '第一部分：...' 仍断段)
-        prev_tail = prev.text.rstrip()
-        if not prev.bold and prev_tail.endswith(("：", ":", "——", "—", "“")):
-            return True
         return False
 
     # 2b) 当前行或上一行以列表符开头(如 'l 胃經腹部...'、'1. xxx')→ 列表项/小标题,必为新段
@@ -352,6 +369,19 @@ def _same_paragraph(prev: TextLine, cur: TextLine, para_gap: float, line_gap: fl
         # 条件:上一行是列表项 且 行尾非句末标点 且 行较长(>25字,是内容被截断而非短标题)
         if prev.list_marker and not _is_para_complete_line(prev) and len(prev.text) > 25:
             return True
+        return False
+
+    # 2b2) 选择题选项行(如 'A. 即耳輪3 區...')→ 独立成段
+    if cur.option_marker:
+        return False
+
+    # 2b2b) 答案行(如 '[答案]D'、'答案：D')→ 独立成段
+    if cur.text.strip() and _ANSWER_MARKER_RE.match(cur.text.strip()):
+        return False
+
+    # 2b3) 短列表项行(如 '第一，耳舟，對應上肢；' w<300pt)→ 独立成段
+    # 耳诊式列表(每项一行);经络式列举(长行连续排版)不受影响
+    if _ENUM_ITEM_RE.match(cur.text) and (cur.bbox[2] - cur.bbox[0]) < 300:
         return False
 
     # 2c) 短加粗行(标题) → 新段:上一行加粗且明显比当前行短(<60%)
@@ -639,10 +669,16 @@ def _is_para_complete(para: Paragraph) -> bool:
     以句号/感叹号/问号/冒号/引号等结尾 → 完整;
     标题/小标题样式(如 '胃經腹部重點穴位診斷作用及功能複習')虽无标点,
     但作为独立标题也是完整的,不参与跨页续接。
+    选项行('A. ...')、列表项行也视为完整,不跨页合并。
     """
     if para.image is not None:
         return True
     if para.style in ("title", "heading"):
+        return True
+    if not para.lines:
+        return True
+    first = para.lines[0]
+    if first.option_marker or first.list_marker:
         return True
     text = para.text.rstrip()
     if not text:

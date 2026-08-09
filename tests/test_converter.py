@@ -247,6 +247,13 @@ def test_ear_docx():
     # 章节标题(冒号结尾的加粗短行)应独立,不被引导语合并逻辑吞并
     assert "第一部分：耳診課內容回顧" in all_text, "章节标题'第一部分'被误合并"
     assert "第二部分 作業講解" in all_text, "章节标题'作業講解'被误合并"
+    # 列表项(短'第X，'行)应独立成段
+    assert "第一，耳舟，對應上肢；" in all_text, "列表项'第一，耳舟'未独立"
+    # 选项行独立
+    assert "A. 即耳輪3 區，三角窩前方的耳輪處" in all_text, "选项A未独立"
+    assert "B. 即耳輪4 區，三角窩前方的耳輪處" in all_text, "选项B未独立"
+    # 答案行独立
+    assert "[答案]D" in all_text, "答案行未独立"
     os.remove(docx_path)
     print(f"\n✅ 耳诊样例测试通过: {result['paragraphs']} 段, {result['images']} 图")
 
