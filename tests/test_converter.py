@@ -142,10 +142,16 @@ def test_realistic_docx():
     img_dir = tempfile.mkdtemp()
     result = convert_pdf_to_docx(pdf_path, docx_path, font_size_label="三号", image_dir=img_dir)
 
-    # 1) 标题:只有全文档第一个加粗单行短段落是 title
-    titles = [b for b in result["preview"] if b["type"] == "text" and b["style"] == "title"]
-    assert len(titles) == 1, f"应只有 1 个 title,实际 {len(titles)} 个: {[t['text'][:20] for t in titles]}"
-    assert titles[0]["text"].startswith("經絡輔導課"), f"title 内容不对: {titles[0]['text']}"
+    # 1) 结构树模式:样式忠实 PDF 结构化信息
+    # 段落边界来自结构树,加粗来自字体名(Bold 字体);不放大标题字号
+    # 课程标题'經絡輔導課...'应为独立段落且加粗
+    d0 = Document(docx_path)
+    title_paras = [p for p in d0.paragraphs if p.text.strip().startswith("經絡輔導課")]
+    assert title_paras, "课程标题段落缺失"
+    tp = title_paras[0]
+    assert any(r.font.bold for r in tp.runs if r.text.strip()), "课程标题应加粗(字体名驱动)"
+    sizes = {r.font.size.pt for r in tp.runs if r.text.strip() and r.font.size}
+    assert sizes == {16.0}, f"课程标题字号应=正文16pt(结构树模式不放大),实际{sizes}"
 
     # 2) 正文对齐:非居中文本不应被误判为 center
     body = [b for b in result["preview"] if b["type"] == "text" and b["style"] == "body"]
@@ -229,14 +235,16 @@ def test_ear_docx():
     assert "定六區：對耳輪上腳所連接的區域是耳輪六區。" in all_text, "完整列表项被误合并"
     # 章节标题(冒号结尾的加粗短行)应独立,不被引导语合并逻辑吞并
     assert "第一部分：耳診課內容回顧" in all_text, "章节标题'第一部分'被误合并"
-    assert "第二部分 作業講解" in all_text, "章节标题'作業講解'被误合并"
+    assert "第二部分作業講解" in all_text.replace(" ", ""), "章节标题'作業講解'被误合并"
+    assert "第三部分問題答疑" in all_text.replace(" ", ""), "章节标题'問題答疑'被误合并"
     # 列表项(短'第X，'行)应独立成段
     assert "第一，耳舟，對應上肢；" in all_text, "列表项'第一，耳舟'未独立"
     # 选项行独立(结构树模式输出清理了空格/括号: 'A.即耳輪3區...')
     assert "即耳輪3區，三角窩前方的耳輪處" in all_text, "选项A未独立"
     assert "即耳輪4區，三角窩前方的耳輪處" in all_text, "选项B未独立"
-    # 答案行独立(结构树输出'答案D'或'[答案]ABCD')
-    assert "答案D" in all_text and "ABCD" in all_text, "答案行未独立"
+    # 答案行独立(结构树输出'[答案]D'或'答案：D')
+    assert ("答案D" in all_text or "[答案]D" in all_text) and "ABCD" in all_text, \
+        "答案行未独立"
     # 选项行样式:选项/答案应为正文(16pt),不是标题
     option_paras = [x for x in d.paragraphs if x.text.strip()
                     and re.match(r"^[A-D][.、．]", x.text.strip())]

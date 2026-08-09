@@ -94,6 +94,14 @@ class Paragraph:
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
 
 
+def _is_bold_font(font_name: str) -> bool:
+    """判断字体是否为粗体(PDF 结构化属性:字体名含 Bold/Black/Heavy)"""
+    if not font_name:
+        return False
+    name = font_name.lower()
+    return any(k in name for k in ("bold", "black", "heavy", "demibold", "semibold"))
+
+
 def _is_cjk_text(text: str) -> bool:
     """判断文本是否以中文为主"""
     if not text:
@@ -215,16 +223,16 @@ def _extract_lines(page: fitz.Page) -> List[TextLine]:
             bbox = line.get("bbox", (0, 0, 0, 0))
             sizes = [s.get("size", 12.0) for s in spans]
             fonts = [s.get("font", "") for s in spans]
-            flags = [s.get("flags", 0) for s in spans]
-            # flags bit 4 (16) = bold
-            bold = any(f & 16 for f in flags)
+            # 加粗 = 字体名含 Bold/Black/Heavy(PDF 结构化样式属性)
+            # 这是 PDF 自身的字体信息,比 flags 位更可靠,也避免内容特判
+            bold = any(_is_bold_font(f) for f in fonts)
             # 行内分段样式:逐 span 收集 (文本, 加粗),供行内部分加粗保留
             span_styles: List[Tuple[str, bool]] = []
             for s in spans:
                 st = _clean_text(s.get("text", ""))
                 if not st:
                     continue
-                span_styles.append((st, bool(s.get("flags", 0) & 16)))
+                span_styles.append((st, _is_bold_font(s.get("font", ""))))
             if not span_styles:
                 span_styles = [(text, bold)]
             lines.append(TextLine(
@@ -569,9 +577,9 @@ class StructPara:
 
 
 def _norm_for_match(s: str) -> str:
-    """规范化文本用于行匹配:去掉括号/方括号残留和空格
+    """规范化文本用于行匹配:去括号/方括号/空格
     结构树 ActualText 常带 Word 导出括号(如 '(YS05)'、'(3)'、'(])'),
-    页面行文本没有;统一去括号后再匹配。
+    页面行文本没有;统一去括号去空格后再匹配。
     """
     s = re.sub(r"[\(\)（）\[\]]", "", s)
     s = re.sub(r"\s+", "", s)
@@ -847,8 +855,10 @@ def _add_image_to_doc(doc: Document, pdf: fitz.Document, img: ImageBlock,
 def add_paragraph(doc: Document, para: Paragraph, font_name: str, base_size: float,
                  pdf: Optional[fitz.Document] = None,
                  image_dir: Optional[str] = None,
-                 page_width: float = 595.0) -> Optional[str]:
+                 page_width: float = 595.0,
+                 struct_path: bool = False) -> Optional[str]:
     """把重建段落写入 docx;图片段落返回本地图片路径
+    :param struct_path: 结构树模式(标题不放大字号,忠实 PDF 样式)
     :return: 图片段落返回图片路径,文本段落返回 None
     """
     if para.image is not None and pdf is not None:
@@ -873,11 +883,13 @@ def add_paragraph(doc: Document, para: Paragraph, font_name: str, base_size: flo
         pf.left_indent = Pt(para.indent_left)
 
     # 样式相关字号
+    # 结构树模式(struct_path=True)忠实 PDF 样式:标题不放大字号,
+    # 加粗由字体决定;启发式模式保留标题放大(老行为)
     if para.style == "title":
-        size = max(base_size * 1.8, 26)
+        size = base_size if struct_path else max(base_size * 1.8, 26)
         bold = True
     elif para.style == "heading":
-        size = max(base_size * 1.4, 18)
+        size = base_size if struct_path else max(base_size * 1.4, 18)
         bold = True
     else:
         size = base_size
@@ -1015,58 +1027,54 @@ def convert_pdf_to_docx(
                         continue
                     sp = obj  # StructPara
                     sp_text = sp.text.strip()
-                    # 样式推断:优先结构类型,退回启发式(字号/加粗/长度)
+                    # 样式推断:只用结构树标签(PDF 结构化信息)
+                    # P/LI → 正文;H/H1/Title → 大标题;H2/H3 → 小标题
+                    # 不做内容特判(如选项/答案/列表项),也不猜标题
                     if sp.type in ("H", "H1", "Title"):
                         style = "title"
                     elif sp.type in ("H2", "H3"):
                         style = "heading"
                     else:
-                        # 从页面行找匹配行推断样式(规范化文本匹配)
-                        sp_norm = _norm_for_match(sp_text)
-                        matched_line = None
-                        for line in page_lines:
-                            lt_norm = _norm_for_match(line.text)
-                            if lt_norm and (lt_norm in sp_norm or sp_norm in lt_norm):
-                                if len(lt_norm) >= max(len(sp_norm) * 0.5, 4):
-                                    matched_line = line
-                                    break
-                        if matched_line is not None:
-                            style = _infer_style(matched_line, not struct_first_done,
-                                                 [matched_line], body_size)
-                        else:
-                            style = "body"
+                        style = "body"
                     para = Paragraph(lines=[], style=style, align="left")
-                    # 从页面行按出现顺序匹配,生成 span 级加粗(行内精确)
-                    sp_norm = _norm_for_match(sp_text)
-                    matched_spans = []  # [(文本片段, 加粗)] 按原顺序
-                    rest = sp_norm
-                    pos = 0
+                    # span 级加粗:按页面行的 span 片段在原文中顺序匹配
+                    # 页面行文本与结构文本一致(无括号差异),直接 find
+                    span_data: List[Tuple[str, bool]] = []
+                    search_pos = 0
+                    matched_any = False
                     for line in page_lines:
-                        # 用该行的 span 级片段(行内可能部分加粗,如穴位名)
-                        line_spans = [(t, b) for t, b in line.spans]
-                        for span_text, span_bold in line_spans:
-                            st_norm = _norm_for_match(span_text)
-                            if not st_norm or len(st_norm) < 2:
+                        for span_text, span_bold in line.spans:
+                            st = span_text.strip()
+                            if not st or len(st) < 2:
                                 continue
-                            idx = rest.find(st_norm, pos)
+                            idx = sp_text.find(st, search_pos)
                             if idx >= 0:
-                                if idx > pos:
-                                    matched_spans.append((rest[pos:idx], False))
-                                matched_spans.append((st_norm, span_bold))
-                                pos = idx + len(st_norm)
-                    if pos < len(rest):
-                        matched_spans.append((rest[pos:], False))
-                    if not matched_spans:
-                        matched_spans = [(sp_norm, False)]
+                                if idx > search_pos:
+                                    span_data.append((sp_text[search_pos:idx], False))
+                                span_data.append((st, span_bold))
+                                search_pos = idx + len(st)
+                                matched_any = True
+                    if search_pos < len(sp_text):
+                        span_data.append((sp_text[search_pos:], False))
+                    if not matched_any:
+                        # 页面行与结构文本不匹配:整段统一加粗(按行级判断)
+                        para_bold_any = any(
+                            line.bold for line in page_lines
+                            if line.text.strip() and len(line.text.strip()) >= 2
+                        )
+                        span_data = [(sp_text, para_bold_any)]
                     # 标题样式整段加粗;正文按行级加粗(span 级)
                     if style in ("title", "heading"):
                         para_bold = True
                         span_data = [(sp_text, True)]
                         out_text = sp_text
                     else:
-                        para_bold = any(b for _, b in matched_spans)
-                        span_data = matched_spans
-                        out_text = "".join(t for t, _ in matched_spans)
+                        para_bold = any(b for _, b in span_data)
+                        out_text = "".join(t for t, _ in span_data)
+                    # 校验拼接是否还原原文(近似匹配可能丢字,回退整段)
+                    if out_text != sp_text:
+                        span_data = [(sp_text, para_bold)]
+                        out_text = sp_text
                     para.lines.append(TextLine(
                         text=out_text, bbox=(0, 0, 0, 0), size=base_size,
                         font=font_name, bold=para_bold, align="left",
@@ -1074,6 +1082,7 @@ def convert_pdf_to_docx(
                     ))
                     # 正文段落:匹配页面行推断首行缩进(结构树无缩进信息)
                     if style == "body":
+                        sp_norm = _norm_for_match(sp_text)
                         best_x0 = 0.0
                         for line in page_lines:
                             lt_norm = _norm_for_match(line.text)
@@ -1084,7 +1093,8 @@ def convert_pdf_to_docx(
                         if best_x0 > 100:
                             para.indent_first = best_x0 - 90.0
                     add_paragraph(doc, para, font_name, base_size,
-                                  pdf=pdf, image_dir=image_dir, page_width=page.rect.width)
+                                  pdf=pdf, image_dir=image_dir, page_width=page.rect.width,
+                                  struct_path=True)
                     para_count += 1
                     if not struct_first_done:
                         struct_first_done = True
