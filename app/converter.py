@@ -517,6 +517,203 @@ def rebuild_paragraphs(lines: List[TextLine], page_width: float, page_height: fl
 
 
 # ---------------------------------------------------------------------------
+# 结构树解析(Tagged PDF 官方段落边界)
+# ---------------------------------------------------------------------------
+
+_ACTUALTEXT_CLEAN = {"(": " ", ")": " ", "（": " ", "）": " ", "( ": " ", " )": " "}
+
+
+def _decode_actualtext(raw: str) -> str:
+    """解码 ActualText:<FEFF...> 是 UTF-16BE hex,否则是字面量"""
+    raw = raw.strip()
+    if raw.startswith("<FEFF") and raw.endswith(">"):
+        try:
+            return bytes.fromhex(raw[5:-1]).decode("utf-16-be", errors="replace")
+        except Exception:  # noqa: BLE001
+            return ""
+    if raw.startswith("<") and raw.endswith(">"):
+        try:
+            hexs = raw[1:-1]
+            if len(hexs) % 4 == 0:
+                return bytes.fromhex(hexs).decode("utf-16-be", errors="replace")
+            return bytes.fromhex(hexs).decode("latin1", errors="replace")
+        except Exception:  # noqa: BLE001
+            return ""
+    # 字面量:过滤孤立的括号残留(Word 导出 PDF 时空格的错误表示)
+    return _ACTUALTEXT_CLEAN.get(raw, raw)
+
+
+@dataclass
+class StructPara:
+    """结构树段落(Tagged PDF 作者真实段落)"""
+    text: str
+    type: str           # 'P' | 'H' | 'H1'..'H3' | 'LI' | 'Title' | ...
+    page_index: int     # 0-based
+    bold: bool = False  # 后续由行信息补充
+
+
+def _norm_for_match(s: str) -> str:
+    """规范化文本用于行匹配:去掉括号/方括号残留和空格
+    结构树 ActualText 常带 Word 导出括号(如 '(YS05)'、'(3)'、'(])'),
+    页面行文本没有;统一去括号后再匹配。
+    """
+    s = re.sub(r"[\(\)（）\[\]]", "", s)
+    s = re.sub(r"\s+", "", s)
+    return s
+
+
+def _merge_struct_with_lines(struct_paras: List[StructPara], pdf: fitz.Document) -> List[StructPara]:
+    """结构树段落 + 页面行融合:补回结构树遗漏的文本(如编号列表项)
+    Word 导出 PDF 时,部分行(尤其列表项)在页面内容流里有文本,
+    但结构树 StructElem 未引用,纯结构树会丢内容。
+    策略:每页用行文本校验结构段落覆盖,未覆盖的行补充为独立段落。
+    """
+    # 每页行文本(规范化)
+    page_lines = {}
+    for i in range(pdf.page_count):
+        page_lines[i] = _extract_lines(pdf[i])
+
+    result: List[StructPara] = []
+    for sp in struct_paras:
+        result.append(sp)
+        # 检查该结构段落后是否有遗漏行(下一页前)
+        # 简化:逐页处理,对每页结构段落与行文本做差异补全
+
+    # 逐页重建:结构段落 + 补充遗漏行,保持顺序
+    by_page = {}
+    for sp in struct_paras:
+        by_page.setdefault(sp.page_index, []).append(sp)
+    merged: List[StructPara] = []
+    for pno in sorted(by_page.keys()):
+        sps = by_page[pno]
+        lines = page_lines.get(pno, [])
+        # 构建已覆盖文本集合
+        covered = set()
+        for sp in sps:
+            covered.add(_norm_for_match(sp.text))
+        # 对每行:若不在任何结构段落中,补充为独立段落
+        for line in lines:
+            ln = _norm_for_match(line.text)
+            if not ln or len(ln) < 4:
+                continue
+            in_covered = False
+            for sp in sps:
+                if ln in _norm_for_match(sp.text) or _norm_for_match(sp.text) in ln:
+                    in_covered = True
+                    break
+            if not in_covered:
+                # 合并相邻未覆盖行为一段
+                merged.append(StructPara(
+                    text=line.text.strip(), type="P", page_index=pno,
+                ))
+        merged.extend(sps)
+    # 排序:按页,同页按出现顺序(简化:页内结构段在补充段之后)
+    merged.sort(key=lambda p: p.page_index)
+    return merged
+
+
+def _extract_structured_paragraphs(pdf: fitz.Document) -> Optional[List[StructPara]]:
+    """从 Tagged PDF 结构树提取作者真实段落。
+    返回 None 表示该 PDF 无结构树(退回启发式段落重建)。
+    """
+    # 1. 找 StructTreeRoot
+    root = None
+    for xref in range(1, pdf.xref_length()):
+        try:
+            obj = pdf.xref_object(xref, compressed=False)
+        except Exception:  # noqa: BLE001
+            continue
+        if "/Type /Catalog" in obj and "/StructTreeRoot" in obj:
+            m = re.search(r"/StructTreeRoot\s+(\d+)\s+0\s+R", obj)
+            if m:
+                root = int(m.group(1))
+                break
+    if not root:
+        return None
+    try:
+        root_obj = pdf.xref_object(root, compressed=False)
+        m = re.search(r"/K\s*\[\s*(\d+)\s+0\s+R", root_obj)
+        if not m:
+            return None
+        doc_elem = int(m.group(1))
+        doc_obj = pdf.xref_object(doc_elem, compressed=False)
+        kid_xrefs = [int(x) for x in re.findall(r"(\d+)\s+0\s+R", doc_obj)]
+    except Exception:  # noqa: BLE001
+        return None
+
+    paras: List[StructPara] = []
+    for k in kid_xrefs:
+        if k == doc_elem:
+            continue
+        try:
+            obj = pdf.xref_object(k, compressed=False)
+        except Exception:  # noqa: BLE001
+            continue
+        if "/StructElem" not in obj:
+            continue
+        sm = re.search(r"/S\s+/(\w+)", obj)
+        stype = sm.group(1) if sm else "P"
+        if stype not in ("P", "H", "H1", "H2", "H3", "Title", "LI", "LBody", "L"):
+            continue
+        pgm = re.search(r"/Pg\s+(\d+)\s+0\s+R", obj)
+        page_xref = int(pgm.group(1)) if pgm else None
+        page_index = 0
+        if page_xref:
+            for pi in range(pdf.page_count):
+                if pdf[pi].xref == page_xref:
+                    page_index = pi
+                    break
+
+        text = ""
+        span_xrefs = [int(x) for x in re.findall(r"(\d+)\s+0\s+R", obj)]
+        for sx in span_xrefs:
+            if sx == k:
+                continue
+            try:
+                sobj = pdf.xref_object(sx, compressed=False)
+            except Exception:  # noqa: BLE001
+                continue
+            if "/StructElem" not in sobj:
+                continue
+            ssm = re.search(r"/S\s+/(\w+)", sobj)
+            stype2 = ssm.group(1) if ssm else "?"
+            atext_m = re.search(r"/ActualText\s+([^\s/]+)", sobj)
+            if stype2 == "Span" and atext_m:
+                text += _decode_actualtext(atext_m.group(1))
+            # 嵌套 Span/LI(一层)
+            if stype2 in ("Span", "L", "LI"):
+                sub_xrefs = [int(x) for x in re.findall(r"(\d+)\s+0\s+R", sobj)]
+                for ssx in sub_xrefs:
+                    if ssx == sx:
+                        continue
+                    try:
+                        ssobj = pdf.xref_object(ssx, compressed=False)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if "/StructElem" not in ssobj:
+                        continue
+                    sat_m = re.search(r"/ActualText\s+([^\s/]+)", ssobj)
+                    if sat_m:
+                        text += _decode_actualtext(sat_m.group(1))
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"\n[ \t]+", "\n", text)
+        text = re.sub(r"\s*\n\s*", "", text)  # 段落内无换行
+        text = re.sub(r"[ \t]{2,}", " ", text).strip()
+        # 清理 Word 导出残留括号(圆括号为导出标记;方括号是原文题目标记,保留)
+        text = re.sub(r"[\(\)（）]", "", text)
+        text = _LIST_MARKER_RE.sub("", text)  # 清理列表符残留(如 'l 胃經腹部...')
+        text = text.strip()
+        if text:
+            paras.append(StructPara(text=text, type=stype, page_index=page_index))
+
+    if not paras:
+        return None
+    # 按页排序(保持文档顺序)
+    paras.sort(key=lambda p: p.page_index)
+    return paras
+
+
+# ---------------------------------------------------------------------------
 # DOCX 生成
 # ---------------------------------------------------------------------------
 
@@ -724,101 +921,200 @@ def convert_pdf_to_docx(
     preview_blocks: List[dict] = []  # 预览结构化数据
     first_text_done = False  # 跨页追踪全文档第一个文本段落(标题识别用)
 
+    # 首选:Tagged PDF 结构树(作者真实段落,无需启发式)
+    struct_paras = _extract_structured_paragraphs(pdf)
+    if struct_paras:
+        struct_paras = _merge_struct_with_lines(struct_paras, pdf)
+    used_struct = struct_paras is not None
+
     try:
-        pending_para: Optional[Paragraph] = None  # 跨页待续接的未完成段落(暂未写入 docx)
-        for i, page in enumerate(pdf):
-            if progress_cb:
-                progress_cb(i + 1, total)
-            # 可选:按 PDF 原页插入分页符(默认关闭,避免 Word 半空页)
-            if i > 0 and page_breaks:
-                doc.add_page_break()
-            lines, images = _extract_elements(page)
-            paragraphs = rebuild_paragraphs(
-                lines, page.rect.width, page.rect.height, images,
-                first_text=not first_text_done,
-            )
-
-            # 跨页段落合并:把上一页未完成段接到本页开头文本段之前
-            if pending_para is not None:
-                first_text_para = next(
-                    (p for p in paragraphs if p.image is None and p.text.strip()),
-                    None,
-                )
-                if first_text_para is not None:
-                    # 上一页未完成段的行 + 本页首段行 = 完整段落
-                    merged_lines = pending_para.lines + first_text_para.lines
-                    pending_para.lines = merged_lines
-                    pending_para.bold = _infer_para_bold(merged_lines)
-                    paragraphs.remove(first_text_para)
-                    paragraphs.insert(0, pending_para)
-                else:
-                    # 本页无文本(纯图片页):pending 无法续接,直接写入
-                    paragraphs.insert(0, pending_para)
-                pending_para = None
-
-            # 确定本页最后一个未完成段落(若存在则不写入,留作跨页续接)
-            last_incomplete = None
-            for para in reversed(paragraphs):
-                if para.image is None and para.text.strip() and not _is_para_complete(para):
-                    last_incomplete = para
-                    break
-
-            # 写入本页所有段落(除 last_incomplete 外)
-            for para in paragraphs:
-                if para is last_incomplete:
-                    continue  # 暂不写入,待下页续接
-                img_path = add_paragraph(
-                    doc, para, font_name, base_size,
-                    pdf=pdf, image_dir=image_dir, page_width=page.rect.width,
-                )
-                if para.image is not None:
+        if struct_paras:
+            # 按页分组写入结构段落
+            import itertools as _it
+            by_page = {}
+            for sp in struct_paras:
+                by_page.setdefault(sp.page_index, []).append(sp)
+            # 预提取每页行级加粗信息(结构树无 bold,需从行信息匹配)
+            page_lines_cache = {}
+            for i in range(pdf.page_count):
+                page_lines_cache[i] = _extract_lines(pdf[i])
+            struct_first_done = False  # 结构树路径跨页追踪全文档首个段落
+            for i, page in enumerate(pdf):
+                if progress_cb:
+                    progress_cb(i + 1, total)
+                if i > 0 and page_breaks:
+                    doc.add_page_break()
+                page_lines = page_lines_cache.get(i, [])
+                # 页面正文基准字号(样式推断用)
+                body_size = _estimate_body_size(page_lines)
+                for sp in by_page.get(i, []):
+                    sp_text = sp.text.strip()
+                    # 样式推断:优先结构类型,退回启发式(字号/加粗/长度)
+                    if sp.type in ("H", "H1", "Title"):
+                        style = "title"
+                    elif sp.type in ("H2", "H3"):
+                        style = "heading"
+                    else:
+                        # 从页面行找匹配行推断样式(规范化文本匹配)
+                        sp_norm = _norm_for_match(sp_text)
+                        matched_line = None
+                        for line in page_lines:
+                            lt_norm = _norm_for_match(line.text)
+                            if lt_norm and (lt_norm in sp_norm or sp_norm in lt_norm):
+                                if len(lt_norm) >= max(len(sp_norm) * 0.5, 4):
+                                    matched_line = line
+                                    break
+                        if matched_line is not None:
+                            style = _infer_style(matched_line, not first_text_done,
+                                                 [matched_line], body_size)
+                        else:
+                            style = "body"
+                    para = Paragraph(lines=[], style=style, align="left")
+                    # 从页面行匹配:判断段落整体加粗(含匹配的加粗行即加粗)
+                    sp_norm = _norm_for_match(sp_text)
+                    para_bold = False
+                    for line in page_lines:
+                        lt_norm = _norm_for_match(line.text)
+                        if not lt_norm or len(lt_norm) < 4:
+                            continue
+                        if lt_norm in sp_norm or sp_norm in lt_norm:
+                            if line.bold:
+                                para_bold = True
+                                break
+                    # 标题样式整段加粗;正文整段按是否含加粗行
+                    if style in ("title", "heading"):
+                        para_bold = True
+                    para.lines.append(TextLine(
+                        text=sp_text, bbox=(0, 0, 0, 0), size=base_size,
+                        font=font_name, bold=para_bold, align="left",
+                        spans=[(sp_text, para_bold)],
+                    ))
+                    # 正文段落:匹配页面行推断首行缩进(结构树无缩进信息)
+                    if style == "body":
+                        best_x0 = 0.0
+                        for line in page_lines:
+                            lt_norm = _norm_for_match(line.text)
+                            if not lt_norm:
+                                continue
+                            if lt_norm in sp_norm or sp_norm in lt_norm:
+                                best_x0 = max(best_x0, line.bbox[0])
+                        if best_x0 > 100:
+                            para.indent_first = best_x0 - 90.0
+                    span_data = [(sp_text, para_bold)]
+                    add_paragraph(doc, para, font_name, base_size,
+                                  pdf=pdf, image_dir=image_dir, page_width=page.rect.width)
+                    para_count += 1
+                    if not first_text_done:
+                        first_text_done = True
+                    preview_blocks.append({
+                        "type": "text",
+                        "text": sp_text,
+                        "style": style,
+                        "align": "left",
+                        "spans": span_data,
+                    })
+            # 图片:结构树不含图片,退回按页提取插图
+            for i, page in enumerate(pdf):
+                for img in _extract_images(page):
+                    img_path = _add_image_to_doc(doc, pdf, img, image_dir or "", page.rect.width)
                     if img_path:
                         image_count += 1
-                    preview_blocks.append({
-                        "type": "image",
-                        "path": img_path,
-                    })
+                        preview_blocks.append({"type": "image", "path": img_path})
+        else:
+            pending_para: Optional[Paragraph] = None  # 跨页待续接的未完成段落(暂未写入 docx)
+            for i, page in enumerate(pdf):
+                if progress_cb:
+                    progress_cb(i + 1, total)
+                # 可选:按 PDF 原页插入分页符(默认关闭,避免 Word 半空页)
+                if i > 0 and page_breaks:
+                    doc.add_page_break()
+                lines, images = _extract_elements(page)
+                paragraphs = rebuild_paragraphs(
+                    lines, page.rect.width, page.rect.height, images,
+                    first_text=not first_text_done,
+                )
+
+                # 跨页段落合并:把上一页未完成段接到本页开头文本段之前
+                if pending_para is not None:
+                    first_text_para = next(
+                        (p for p in paragraphs if p.image is None and p.text.strip()),
+                        None,
+                    )
+                    if first_text_para is not None:
+                        # 上一页未完成段的行 + 本页首段行 = 完整段落
+                        merged_lines = pending_para.lines + first_text_para.lines
+                        pending_para.lines = merged_lines
+                        pending_para.bold = _infer_para_bold(merged_lines)
+                        paragraphs.remove(first_text_para)
+                        paragraphs.insert(0, pending_para)
+                    else:
+                        # 本页无文本(纯图片页):pending 无法续接,直接写入
+                        paragraphs.insert(0, pending_para)
+                    pending_para = None
+
+                # 确定本页最后一个未完成段落(若存在则不写入,留作跨页续接)
+                last_incomplete = None
+                for para in reversed(paragraphs):
+                    if para.image is None and para.text.strip() and not _is_para_complete(para):
+                        last_incomplete = para
+                        break
+
+                # 写入本页所有段落(除 last_incomplete 外)
+                for para in paragraphs:
+                    if para is last_incomplete:
+                        continue  # 暂不写入,待下页续接
+                    img_path = add_paragraph(
+                        doc, para, font_name, base_size,
+                        pdf=pdf, image_dir=image_dir, page_width=page.rect.width,
+                    )
+                    if para.image is not None:
+                        if img_path:
+                            image_count += 1
+                        preview_blocks.append({
+                            "type": "image",
+                            "path": img_path,
+                        })
+                    else:
+                        para_count += 1
+                        if not first_text_done:
+                            first_text_done = True
+                        preview_blocks.append({
+                            "type": "text",
+                            "text": para.text,
+                            "style": para.style,
+                            "align": para.align,
+                            # span 级加粗:每行各 span 的 (文本, 加粗) 列表(预览用)
+                            "spans": [(t, b) for line in para.lines for t, b in line.spans]
+                            if para.style == "body" else [],
+                        })
+
+                # 下页待续接
+                pending_para = last_incomplete
+
+            # 处理末尾残留的未完成段落(文档结尾无下一页)
+            if pending_para is not None:
+                img_path = add_paragraph(
+                    doc, pending_para, font_name, base_size, pdf=None,
+                    image_dir=image_dir, page_width=595.0,
+                )
+                if pending_para.image is not None:
+                    if img_path:
+                        image_count += 1
+                    preview_blocks.append({"type": "image", "path": img_path})
                 else:
                     para_count += 1
                     if not first_text_done:
                         first_text_done = True
                     preview_blocks.append({
                         "type": "text",
-                        "text": para.text,
-                        "style": para.style,
-                        "align": para.align,
-                        # span 级加粗:每行各 span 的 (文本, 加粗) 列表(预览用)
-                        "spans": [(t, b) for line in para.lines for t, b in line.spans]
-                        if para.style == "body" else [],
+                        "text": pending_para.text,
+                        "style": pending_para.style,
+                        "align": pending_para.align,
+                        "spans": [(t, b) for line in pending_para.lines for t, b in line.spans]
+                        if pending_para.style == "body" else [],
                     })
-
-            # 下页待续接
-            pending_para = last_incomplete
     finally:
         pdf.close()
-
-    # 处理末尾残留的未完成段落(文档结尾无下一页)
-    if pending_para is not None:
-        img_path = add_paragraph(
-            doc, pending_para, font_name, base_size, pdf=None,
-            image_dir=image_dir, page_width=595.0,
-        )
-        if pending_para.image is not None:
-            if img_path:
-                image_count += 1
-            preview_blocks.append({"type": "image", "path": img_path})
-        else:
-            para_count += 1
-            if not first_text_done:
-                first_text_done = True
-            preview_blocks.append({
-                "type": "text",
-                "text": pending_para.text,
-                "style": pending_para.style,
-                "align": pending_para.align,
-                "spans": [(t, b) for line in pending_para.lines for t, b in line.spans]
-                if pending_para.style == "body" else [],
-            })
 
     doc.save(docx_path)
 
